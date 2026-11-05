@@ -226,7 +226,7 @@ export class NapCatOneBotAdapter {
   private sendingAlert = false;
   /** 提醒（所有人可用）：/remind 命令，或模型在回复里写 [提醒:时间|内容] 标记 */
   private readonly reminders = new ReminderStore((r, late) => this.deliverReminder(r, late));
-  /** 每日一图（群主/管理员开通）。NAPCAT_DAILY_PUSH=0 全局关闭 */
+  /** 每日一图（群主/群管理员或机器人管理员开通）。NAPCAT_DAILY_PUSH=0 全局关闭 */
   private readonly daily: DailyPushScheduler | null = process.env.NAPCAT_DAILY_PUSH === '0' ? null
     : new DailyPushScheduler((sub, date) => this.pushDaily(sub, date));
   /** 每日一图选好但还没发出去的图（发送失败重试时发同一张，不再换一张） */
@@ -1411,9 +1411,9 @@ export class NapCatOneBotAdapter {
           '- 申请图片：直接说「来张信浓」，或 `/pixiv <关键词> [数量]`；',
           '- 图片反馈：引用我发的图说「好看」「不喜欢」「拉黑这个画师」，以后找图会参考；`/prefs` 查看，`/prefs reset` 清空；',
           '- 提醒：`/remind 10分钟后 喝水`、`/remind 明天8点 开会`，或者直接跟我说「明早八点叫我」；`/reminders` 查看，`/remind del 编号` 删除；',
-          '- `/daily on [HH:MM]|off|status`：每日一图，每天推一张 Pixiv 日榜插画（群里由群主/管理员开通，默认 12:00）；',
+          '- `/daily on [HH:MM]|off|status`：每日一图，每天推一张 Pixiv 日榜插画（群里由群主/群管理员或机器人管理员开通，默认 12:00）；',
           '- `/clear`：清空当前会话记忆，开启新对话；',
-          '- `/proactive on|off|status`：群里由群主/管理员开通后，哈gemi 会主动接话、冷场冒泡、叫名字不用 @；私聊里开通则偶尔主动找你；',
+          '- `/proactive on|off|status`：群里由群主/群管理员或机器人管理员开通后，哈gemi 会主动接话、冷场冒泡、叫名字不用 @；私聊里开通则偶尔主动找你；',
           '- `/ping`：健康检查；',
           '- `/help`：查看此帮助。',
           ...(isAdmin ? [
@@ -1533,7 +1533,7 @@ export class NapCatOneBotAdapter {
             // 影响全群，只有机器人管理员或本群群主/管理员能开关
             const canManage = this.access.isAdmin(userId) || senderRole === 'owner' || senderRole === 'admin';
             if (!canManage) {
-              await this.sendReply(scope, targetId, '⛔ 只有群主/群管理员能开关我的主动模式哦。', replyMsgId);
+              await this.sendReply(scope, targetId, '⛔ 只有群主/群管理员或机器人管理员能开关我的主动模式哦。', replyMsgId);
               return true;
             }
             this.groupProactive.setEnabled(targetId, action === 'on');
@@ -1545,7 +1545,7 @@ export class NapCatOneBotAdapter {
           }
           const status = this.groupProactive.isEnabled(targetId)
             ? `群聊主动模式：已开通\n- ${this.chime.describe()}\n- 冷场冒泡：${this.groupProactive.statusText(targetId).replace(/^主动消息：已开通 · /, '')}`
-            : '群聊主动模式：未开通（群主/管理员发 `@哈Gemi /proactive on` 开通）';
+            : '群聊主动模式：未开通（群主/群管理员或机器人管理员发 `@哈Gemi /proactive on` 开通）';
           await this.sendReply(scope, targetId, `${status}\n用法：\`/proactive on|off|status\``, replyMsgId);
           return true;
         }
@@ -1611,7 +1611,7 @@ export class NapCatOneBotAdapter {
         const canManage = scope === 'c2c' || this.access.isAdmin(userId) || senderRole === 'owner' || senderRole === 'admin';
         if (action === 'reset' || action === 'clear') {
           if (!canManage) {
-            await this.sendReply(scope, targetId, '⛔ 群里的找图偏好只有群主/群管理员能清空哦。', replyMsgId);
+            await this.sendReply(scope, targetId, '⛔ 群里的找图偏好只有群主/群管理员或机器人管理员能清空哦。', replyMsgId);
             return true;
           }
           const had = prefs.reset(chatKey);
@@ -1656,7 +1656,7 @@ export class NapCatOneBotAdapter {
         const canManage = scope === 'c2c' || this.access.isAdmin(userId) || senderRole === 'owner' || senderRole === 'admin';
         if (action === 'on' || action === 'off') {
           if (!canManage) {
-            await this.sendReply(scope, targetId, '⛔ 只有群主/群管理员能开关每日一图哦。', replyMsgId);
+            await this.sendReply(scope, targetId, '⛔ 只有群主/群管理员或机器人管理员能开关每日一图哦。', replyMsgId);
             return true;
           }
           let time: string | undefined;
