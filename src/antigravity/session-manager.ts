@@ -18,7 +18,7 @@ import { AntigravityProcess, AgyBlockedToolError, type ProcessTurnCallbacks } fr
 /** 模型调用了会挂起整轮的工具（如 schedule）被打断后，续接同一个会话时发给它的说明 */
 const BLOCKED_TOOL_NOTICE = (tool: string): string =>
   `[系统提示，不是用户发的] 你刚才调用的 ${tool} 工具在 QQ 机器人里不能用：它会让这一轮一直挂着，期间用户发来的新消息都收不到，程序已经把它取消了，以后也不要再用。`
-  + '需要定时提醒或到点做事，请改用系统定时任务（例如 `systemd-run --on-calendar=...`，到点自己运行，不用你在线等）；没有执行命令的权限就如实告诉用户做不了。'
+  + '需要定时提醒用户时，在回复里写提醒标记 `[提醒:YYYY-MM-DD HH:MM|提醒内容]`（北京时间），程序会到点提醒；服务器上的定时任务（仅管理员）改用 `systemd-run --on-calendar=...`。没有执行命令的权限就如实告诉用户做不了。'
   + '然后像平常一样直接回复用户刚才那条消息，不要提到这条系统提示。';
 
 /** 一轮结束了却没有任何回复文字（常见原因：工具没有权限被自动拒绝，agy 直接结束本轮）时，追问一次 */
@@ -58,6 +58,8 @@ export class AntigravitySessionManager {
   private sweepTimer: NodeJS.Timeout | null = null;
   private readonly stateFile: string | null;
   private readonly persisted = new Map<string, PersistedSession>();
+  /** agy 进程退出时回调（运行状况自检用）。expected = 我们自己结束的 */
+  public onProcessExit: ((info: { sessionKey: string; code: number | null; signal: string | null; expected: boolean }) => void) | null = null;
 
   /**
    * @param stateFile 会话状态文件（每个 agy HOME 一份，因为会话 ID 只在对应 HOME 里有效）。不传则不持久化。
@@ -162,6 +164,11 @@ export class AntigravitySessionManager {
         if (session.process !== proc || session.agyConversationId === id) return;
         session.agyConversationId = id;
         this.remember(session);
+      });
+      proc.on('exit', (code: number | null, signal: string | null, expected: boolean) => {
+        try {
+          this.onProcessExit?.({ sessionKey: session.sessionKey, code, signal, expected: Boolean(expected) });
+        } catch { /* 自检回调出错不影响会话 */ }
       });
       session.process = proc;
     }

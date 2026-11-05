@@ -221,7 +221,8 @@ export class AntigravityProcess extends EventEmitter {
         if (this.config.debug) {
           console.debug(`[AntigravityProcess] Process exit (${this.conversationId}): code=${code}, signal=${signal}`);
         }
-        this.emit('exit', code, signal);
+        // 第三个参数：是不是我们自己结束的（空闲回收、超时打断、/clear）。运行状况自检据此区分「意外退出」
+        this.emit('exit', code, signal, this.isTerminating);
         if (this.initResolve) {
           this.initResolve = null;
           reject(new Error(`agy process exited prematurely with code ${code}`));

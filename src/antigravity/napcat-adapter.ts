@@ -30,6 +30,15 @@ import { prepareImageForSend } from '../media/image-optimizer.ts';
 import { ProactiveScheduler, DEFAULT_GROUP_PROACTIVE_CONFIG, DEFAULT_GROUP_PROACTIVE_FILE } from './proactive.ts';
 import { GroupChime, BOT_NAME_RE, isSkipReply, envNumber, stripBotName, neutralize } from './group-chime.ts';
 import { PokeReactor } from './poke.ts';
+import {
+  ReminderStore, parseWhen, extractReminderMarkers, formatWhen, cstDate,
+  REMIND_INTENT_RE, REMIND_PROMISE_RE, type Reminder, type ReminderDeliverResult,
+} from './reminders.ts';
+import { HealthMonitor, hhmm } from './health.ts';
+import { classifyImageFeedback, trailingImageAsk, type ImageFeedback } from './feedback.ts';
+import { DailyPushScheduler, normalizeDailyTime, type DailySub, type DailyPushResult } from './daily-push.ts';
+import type { SentImageInfo } from './sent-media.ts';
+import type { PixivIllustration } from '../pixiv/index.ts';
 import type { AntigravityBotConfig, AntigravityConfig } from './types.ts';
 
 /** 重试用尽后抛出：调用方据此向会话汇报一次「发送受限」，而不是把底层报错原样吐出去 */
@@ -53,6 +62,16 @@ const SEND_FAILED_NOTICE = (err: NapCatSendError, extra = ''): string =>
 
 /** 只 @ 了机器人、什么都没说时，替代正文交给 Agent 的说明（2026-11-05 某群：纯 @ 被当成空消息丢弃） */
 const PURE_CALL_NOTE = '[对方只是 @ 了你一下，没有说别的内容。像被人叫到名字一样，用你的口吻自然地应一声、问问 TA 有什么事，一两句就好；不要找图，不要调用任何工具。]';
+
+/** 用户这条像是要提醒时附在提示词里：提醒只有写了标记才会生效（规则也写在 AGENTS.md） */
+const REMIND_HINT = '[提醒功能（系统说明）：如果 TA 是想让你到时间提醒 TA，就在回复里另起一行写标记 [提醒:YYYY-MM-DD HH:MM|提醒内容]'
+  + '（北京时间，按上面的当前时间算；也可以写 [提醒:30分钟后|内容]），程序会到点在这里提醒 TA，标记本身不会显示出来。'
+  + '不写标记就不会提醒，千万别只口头答应。不是要提醒就忽略这条。]\n';
+
+/** 回复里给用户看的文字：去掉提醒标记和表情标记（记进群聊上下文时用） */
+function visibleText(s: string): string {
+  return extractExpression(extractReminderMarkers(s).clean).clean;
+}
 
 /**
  * 解析消息时给 @ 留的占位符：AT_OTHER + QQ号 + AT_OTHER 是 @ 了别人，AT_SELF 是 @ 了机器人。
@@ -201,6 +220,17 @@ export class NapCatOneBotAdapter {
   private readonly sentMedia = new SentMediaLog();
   /** 发送超时后已被认领为「其实发出去了」的自己的消息 ID，避免一条消息被认领两次 */
   private readonly claimedSelfMsgIds = new Set<string>();
+  /** 运行状况自检：内存/OOM/断线/回合失败/发送失败，告警私聊发给管理员，/diag 查看 */
+  private readonly health = new HealthMonitor(text => this.sendAdminAlert(text), () => this.healthExtra());
+  /** 正在给管理员发运行告警：这时候的发送失败不再算进告警统计，免得告警自己触发告警 */
+  private sendingAlert = false;
+  /** 提醒（所有人可用）：/remind 命令，或模型在回复里写 [提醒:时间|内容] 标记 */
+  private readonly reminders = new ReminderStore((r, late) => this.deliverReminder(r, late));
+  /** 每日一图（群主/管理员开通）。NAPCAT_DAILY_PUSH=0 全局关闭 */
+  private readonly daily: DailyPushScheduler | null = process.env.NAPCAT_DAILY_PUSH === '0' ? null
+    : new DailyPushScheduler((sub, date) => this.pushDaily(sub, date));
+  /** 每日一图选好但还没发出去的图（发送失败重试时发同一张，不再换一张） */
+  private readonly dailyPicks = new Map<string, { illust: PixivIllustration; rank: number; mode: 'day' | 'week' }>();
   private ws: any = null;
   private isRunning = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -256,6 +286,10 @@ export class NapCatOneBotAdapter {
       guest: new AntigravitySessionManager(guestConfig(this.guestHomes.guest), this.config.groupSessionScope, stateFile('guest')),
       'guest-grey': new AntigravitySessionManager(guestConfig(this.guestHomes['guest-grey']), this.config.groupSessionScope, stateFile('guest-grey')),
     };
+    for (const [tier, m] of Object.entries(this.managers)) {
+      m.onProcessExit = info => this.health.noteAgyExit(tier, info.sessionKey, info.code, info.signal, info.expected);
+    }
+    if (this.memory) this.memory.onExit = (code, signal, expected) => this.health.noteMemoryExit(code, signal, expected);
   }
 
   /** 管理员那一档的会话管理器（保持原有公开接口） */
@@ -334,6 +368,9 @@ export class NapCatOneBotAdapter {
     this.proactive?.start();
     this.groupProactive?.start();
     this.startGuestJanitor();
+    this.health.start();
+    this.reminders.start();
+    this.daily?.start();
     this.connect();
   }
 
@@ -354,9 +391,16 @@ export class NapCatOneBotAdapter {
     this.proactive?.stop();
     this.groupProactive?.stop();
     this.chime.flush();
+    this.reminders.stop();
+    this.daily?.stop();
     if (this.janitorTimer) { clearInterval(this.janitorTimer); this.janitorTimer = null; }
     await Promise.all(Object.values(this.managers).map(m => m.disposeAll()));
+    this.health.stop(true);
     console.log('[NapCatAdapter] Stopped.');
+  }
+
+  private isWsOpen(): boolean {
+    return !!this.ws && this.ws.readyState === 1;
   }
 
   private connect(): void {
@@ -372,6 +416,9 @@ export class NapCatOneBotAdapter {
 
       this.ws.onopen = () => {
         console.log(`[NapCatAdapter] ✅ Connected to NapCat OneBot 11 at ${this.config.wsUrl}`);
+        this.health.noteWsUp();
+        // 断线期间到点的提醒，连上就补发
+        setTimeout(() => { void this.reminders.tick(); }, 3000).unref?.();
         // 请求自身信息核对 self_id
         this.callApi('get_login_info').then((info: any) => {
           if (info && info.user_id) {
@@ -393,11 +440,13 @@ export class NapCatOneBotAdapter {
 
       this.ws.onclose = (event: any) => {
         console.warn(`[NapCatAdapter] ⚠️ Connection closed (code: ${event?.code || 'N/A'}). Reconnecting in ${this.config.reconnectIntervalMs}ms...`);
+        if (this.isRunning) this.health.noteWsDown(event?.code);
         this.scheduleReconnect();
       };
 
       this.ws.onerror = (err: any) => {
         console.error('[NapCatAdapter] ❌ WebSocket error:', err?.message || err);
+        if (this.isRunning) this.health.noteWsDown('error');
         // 握手阶段失败（例如 NapCat 的 WS 端口暂时不可达、non-101）时，某些实现只触发 error 不触发 close，
         // 只靠 onclose 调度重连会让进程卡死、NapCat 恢复后也不再连接。这里也调度一次；
         // scheduleReconnect 内部有 reconnectTimer 去重，和 onclose 同时触发不会重复排程。
@@ -683,6 +732,18 @@ export class NapCatOneBotAdapter {
       console.log(`[NapCatAdapter] Inbound [${scope}:${targetId}] from ${userId}: "${text}"${shown} (media: ${imageUrls.length}, at: ${isMentioned})`);
     }
 
+    // 对她发的图的反馈（喜欢/不喜欢/拉黑画师）：引用了她的图就算（群里没 @ 也记），没引用时只在私聊或 @ 她、且刚发过图时才看。
+    // 记进这个会话的搜图偏好；拉黑画师回一句确认就结束，喜欢/不喜欢静默记下、照常往下走
+    const feedback = imageUrls.length === 0 ? this.detectFeedback(scope, targetId, text, replyMsgId, !isGroup || isMentioned) : null;
+    let feedbackNote = '';
+    if (feedback) {
+      const handled = await this.applyFeedback(scope, targetId, userId, feedback, effectiveReplyId, !isGroup || isMentioned);
+      if (handled === true) return;
+      feedbackNote = handled || '';
+    }
+    // 「不好看，换一张」：反馈记完后，后半句按「再来一张」处理
+    const routeText = (feedback && trailingImageAsk(text)) || text;
+
     // 群聊按配置判断是否必须 @ 自己；开通主动模式的群，没 @ 时按概率插话
     if (isGroup && this.config.requireMention && !isMentioned) {
       if (groupActive && imageUrls.length === 0 && !text.startsWith('/') && this.chime.reserveChime(groupId!, text)) {
@@ -716,7 +777,7 @@ export class NapCatOneBotAdapter {
     // 搜图槽位规则（见 search-slots.ts）：纯指代（再来一张）只继承主角色；带新内容的要图、
     // 重述标签（就是有A和B啦）都以本条消息全量重写；R-18 等灰名单授权只看本条消息，绝不跨轮继承。
     if (imageUrls.length === 0) {
-      const ask = classifyImageAsk(text, parseNaturalPixivQuery, t => this.isKnownTag(t));
+      const ask = classifyImageAsk(routeText, parseNaturalPixivQuery, t => this.isKnownTag(t));
       const route = ask ? this.resolveImageRoute(ask, SearchSlotTracker.keyFor(scope, targetId, userId)) : null;
       if (route) {
         if (this.config.debug) {
@@ -766,11 +827,14 @@ export class NapCatOneBotAdapter {
     if (quote?.media.length) downloadedMedia = [...downloadedMedia, ...quote.media];
     const recentBlock = this.recentImagesBlock(chatKey);
     const body = pureCall ? PURE_CALL_NOTE : buildPromptWithMedia(agentText, downloadedMedia);
-    const prompt = `[会话标识：${chatKey}]\n[用户标识：qq:${userId}]\n[身份：${identity}]\n${context}${memoryBlock}${recentBlock}${quote?.text ?? ''}${body}`;
+    // 管理员私聊：最近的运行异常（程序记录），被问「刚才怎么了」时有据可依。群里不带（AGENTS.md §8）
+    const healthBlock = tier === 'admin' && scope === 'c2c' ? this.healthBlock() : '';
+    const remindAsked = !pureCall && REMIND_INTENT_RE.test(text);
+    const prompt = `[会话标识：${chatKey}]\n[用户标识：qq:${userId}]\n[身份：${identity}]\n${context}${healthBlock}${memoryBlock}${recentBlock}${quote?.text ?? ''}${feedbackNote}${remindAsked ? REMIND_HINT : ''}${body}`;
 
     // 6. 发送到 Antigravity Agent 执行 Turn
     try {
-      const response = await this.managers[tier].executeTurn(
+      const raw = await this.managers[tier].executeTurn(
         scope,
         targetId,
         userId,
@@ -778,17 +842,24 @@ export class NapCatOneBotAdapter {
       );
 
       // 回复是空的：说一声，不要让用户以为消息没送到（2026-11-05 漏接：空回复被静默吞掉）
-      if (!response || !response.trim()) {
+      if (!raw || !raw.trim()) {
         console.warn(`[NapCatAdapter] empty agent reply for [${scope}:${targetId}] from ${userId}`);
+        this.health.event('empty_reply', `${tier} ${scope}:${targetId}`, 'warn');
         await this.sendReply(scope, targetId, '（这条我没能生成回复，麻烦再发一次～）', effectiveReplyId);
         return;
       }
+      this.health.noteTurnOk();
+      // 回复里的提醒标记 → 建提醒（绑定这条消息的真实发送者和会话），并换成程序的确认语
+      const response = this.applyReminderMarkers(scope, targetId, userId, raw, remindAsked);
       // 提取回复中的本地文件并转为 CQ 码发送
       await this.deliverAgentResponse(scope, targetId, response, effectiveReplyId, downloadedMedia.length === 0);
       this.rememberTurn(memKey, agentText, response);
-      if (groupActive) this.chime.record(groupId!, '哈Gemi', extractExpression(response).clean, true);
+      if (groupActive) this.chime.record(groupId!, '哈Gemi', visibleText(response), true);
     } catch (err) {
       console.error(`[NapCatAdapter] Agent turn execution failed:`, err);
+      if (!(err instanceof NapCatSendError) && !/reset by user|manager disposed/i.test(err instanceof Error ? err.message : '')) {
+        this.health.noteTurnFailure(`${tier} ${scope}`, err instanceof AgyTurnTimeoutError ? '回合超时（长时间没有输出）' : (err instanceof Error ? err.message : String(err)).slice(0, 160));
+      }
       // 超时前已经写出来的内容先发出去，再说明后面被中断了
       if (err instanceof AgyTurnTimeoutError && err.partialText.trim()) {
         try {
@@ -956,7 +1027,7 @@ export class NapCatOneBotAdapter {
         return false;
       }
       await this.deliverAgentResponse('group', groupId, response, undefined, false);
-      this.chime.record(groupId, '哈Gemi', extractExpression(trimmed).clean, true);
+      this.chime.record(groupId, '哈Gemi', visibleText(trimmed), true);
       console.log(`[GroupProactive] ${mode} sent in ${groupId}`);
       return true;
     } catch (err) {
@@ -1121,6 +1192,204 @@ export class NapCatOneBotAdapter {
     }
   }
 
+  // ───────────────────────── 图片反馈 / 提醒 / 每日一图 / 运行状况 ─────────────────────────
+
+  /**
+   * 这条消息是不是对她发的图的反馈。引用了她在这个会话发的图：按那张图算；
+   * 没引用：只在私聊或 @ 她（addressed）、3 分钟内刚发过图、且这条不是在要图时才算，默认指最后一张。
+   */
+  private detectFeedback(
+    scope: 'c2c' | 'group',
+    targetId: string,
+    text: string,
+    replyMsgId: number | string | undefined,
+    addressed: boolean,
+  ): { kind: ImageFeedback; works: SentImageInfo[] } | null {
+    if (!text) return null;
+    const chatKey = `${scope}:${targetId}`;
+    if (replyMsgId !== undefined && replyMsgId !== null && replyMsgId !== '') {
+      const quoted = this.sentMedia.byMessageId(replyMsgId);
+      if (!quoted || quoted.chatKey !== chatKey) return null; // 引用的是别的消息：不是在评价她的图
+      const kind = classifyImageFeedback(text, { quoted: true });
+      return kind ? { kind, works: [quoted] } : null;
+    }
+    if (!addressed) return null;
+    const recent = this.sentMedia.recent(chatKey, 5, 3 * 60_000);
+    if (recent.length === 0) return null;
+    const kind = classifyImageFeedback(text, { quoted: false });
+    if (!kind) return null;
+    if (kind !== 'dislike' && classifyImageAsk(text, parseNaturalPixivQuery, t => this.isKnownTag(t))) return null; // 「再来张好看的」是在要图
+    const last = recent[recent.length - 1]!;
+    const batch = recent.filter(i => last.at - i.at <= 60_000);
+    return { kind, works: kind !== 'block-artist' && /都|全|这些|这几张/.test(text) ? batch : [last] };
+  }
+
+  /**
+   * 把反馈记进偏好。返回 true：已经回复过（拉黑画师），这条消息到此为止；
+   * 返回字符串：给 Agent 的说明（喜欢/不喜欢静默记下，她照常回复时知道这件事）。
+   */
+  private async applyFeedback(
+    scope: 'c2c' | 'group',
+    targetId: string,
+    userId: string,
+    fb: { kind: ImageFeedback; works: SentImageInfo[] },
+    replyMsgId: number | string | undefined,
+    addressed: boolean,
+  ): Promise<true | string> {
+    const chatKey = `${scope}:${targetId}`;
+    const prefs = defaultPixivService.prefs;
+    if (fb.kind === 'block-artist') {
+      const artist = fb.works[0]?.artist?.trim();
+      if (!artist || artist === '未知' || artist === '未知画师') {
+        await this.sendReply(scope, targetId, '这张图我没记下画师是谁，拉黑不了…换一张试试？', replyMsgId);
+        return true;
+      }
+      const ok = prefs.blockArtist(chatKey, artist);
+      console.log(`[Prefs] ${chatKey} block artist "${artist}" by ${userId} -> ${ok ? 'ok' : 'already'}`);
+      const name = escapeCqText(artist);
+      await this.sendReply(scope, targetId, ok
+        ? `好，${scope === 'group' ? '这个群' : '你这边'}以后不发「${name}」的图了。想恢复就发 /prefs unblock ${name}`
+        : `「${name}」已经在不发的名单里啦。`, replyMsgId);
+      return true;
+    }
+    for (const w of fb.works) prefs.feedback(chatKey, { pid: w.pid, artist: w.artist, tags: w.tags }, fb.kind);
+    console.log(`[Prefs] ${chatKey} ${fb.kind} pid=${fb.works.map(w => w.pid).join(',')} by ${userId}`);
+    if (!addressed) return '';
+    const what = fb.works.length > 1 ? `刚才那 ${fb.works.length} 张图` : `那张图（画师 ${neutralize(fb.works[0]!.artist, 40)}）`;
+    return `[程序已按 TA 的反馈记下：TA ${fb.kind === 'like' ? '喜欢' : '不喜欢'}${what}，以后给这个会话找图会参考${fb.kind === 'dislike' ? '，那张也不会再发' : ''}。自然地回应就好，不用复述这条]\n`;
+  }
+
+  /**
+   * 处理回复里的提醒标记：建提醒（绑定这条消息的发送者和会话，模型指定不了别人），标记从正文抹掉，
+   * 末尾加程序的确认（或失败原因）。用户要提醒、回复口头答应了却没写标记的，也如实说明没设上。
+   */
+  private applyReminderMarkers(scope: 'c2c' | 'group', targetId: string, userId: string, response: string, asked: boolean): string {
+    const { clean, items } = extractReminderMarkers(response);
+    const notes: string[] = [];
+    for (const it of items.slice(0, 3)) {
+      const p = parseWhen(it.when);
+      const res = p && !p.rest
+        ? this.reminders.add({ scope, targetId, userId, text: it.text, dueAt: p.at })
+        : { ok: false as const, error: `时间「${it.when.slice(0, 30)}」没看懂` };
+      if (res.ok) {
+        console.log(`[Reminders] ${userId} in ${scope}:${targetId} -> ${res.reminder.id} at ${new Date(res.reminder.dueAt).toISOString()} (marker)`);
+        notes.push(`⏰ 已记下：${formatWhen(res.reminder.dueAt)} 提醒「${res.reminder.text}」，编号 ${res.reminder.id}，发 /reminders 可以查看`);
+      } else {
+        notes.push(`⏰ 提醒没设上：${res.error}`);
+      }
+    }
+    if (items.length > 3) notes.push('⏰ 一次最多设 3 个提醒，多的没记');
+    if (items.length === 0 && asked && REMIND_PROMISE_RE.test(clean)) {
+      notes.push('⏰ 提醒其实没设上。发 /remind 时间 内容 就能设，比如 /remind 明天8点 开会');
+    }
+    if (notes.length === 0) return items.length ? clean : response;
+    return `${clean}\n${notes.map(n => `（${n}）`).join('\n')}`.trim();
+  }
+
+  /** 到点发提醒：群里 @ 本人，私聊直接发；晚了超过 3 分钟（停机期间到点）注明 */
+  private async deliverReminder(r: Reminder, lateMs: number): Promise<ReminderDeliverResult> {
+    if (!this.isWsOpen()) return 'retry';
+    const late = lateMs > 3 * 60_000 ? `（本该 ${formatWhen(r.dueAt)} 提醒的，晚了 ${Math.round(lateMs / 60_000)} 分钟，抱歉）` : '';
+    const body = `⏰ 到点啦，提醒你：${escapeCqText(r.text)}${late}`;
+    try {
+      await this.sendMessageRaw(r.scope, r.targetId, r.scope === 'group' ? `[CQ:at,qq=${escapeCqParam(r.userId)}] ${body}` : body);
+      console.log(`[Reminders] delivered ${r.id} to ${r.userId} in ${r.scope}:${r.targetId}`);
+      return 'sent';
+    } catch (err) {
+      console.warn(`[Reminders] deliver ${r.id} failed:`, err instanceof Error ? err.message : err);
+      return 'failed';
+    }
+  }
+
+  /** 每日一图到点：取日榜里给这个会话的一张，发出去。发送失败时下次重发同一张 */
+  private async pushDaily(sub: DailySub, date: string): Promise<DailyPushResult> {
+    if (!this.isWsOpen()) return 'retry';
+    const chatKey = `${sub.scope}:${sub.targetId}`;
+    const cacheKey = `${chatKey}|${date}`;
+    let pick = this.dailyPicks.get(cacheKey);
+    if (!pick) {
+      try {
+        const res = await defaultPixivService.pickRanking(chatKey, { mode: 'day' });
+        if (!res) {
+          this.health.event('daily_push', `${chatKey} 日榜里没有可发的图（都发过或不合规）`, 'info');
+          return 'skip';
+        }
+        pick = res;
+      } catch (err) {
+        this.health.event('daily_push', `${chatKey} 取日榜失败：${err instanceof Error ? err.message : String(err)}`, 'warn');
+        return 'retry';
+      }
+      if (this.dailyPicks.size > 200) this.dailyPicks.clear();
+      this.dailyPicks.set(cacheKey, pick);
+    }
+    try {
+      await this.sendDailyPick(sub.scope, sub.targetId, pick);
+      this.dailyPicks.delete(cacheKey);
+      console.log(`[DailyPush] sent pid=${pick.illust.pid} (rank ${pick.rank}) to ${chatKey}`);
+      return 'sent';
+    } catch (err) {
+      console.warn(`[DailyPush] send to ${chatKey} failed:`, err instanceof Error ? err.message : err);
+      return 'retry';
+    }
+  }
+
+  private async sendDailyPick(
+    scope: 'c2c' | 'group',
+    targetId: string,
+    pick: { illust: PixivIllustration; rank: number; mode: 'day' | 'week' },
+  ): Promise<void> {
+    const sendPath = await prepareImageForSend(pick.illust.localPath);
+    const msgId = await this.sendMessageRaw(scope, targetId,
+      `🌟 每日一图 · Pixiv ${pick.mode === 'week' ? '周' : '日'}榜第 ${pick.rank} 名\n[CQ:image,file=file://${escapeCqParam(sendPath)}]\n🎨 画师：${escapeCqText(pick.illust.artist)}`);
+    this.sentMedia.note(msgId, {
+      chatKey: `${scope}:${targetId}`, pid: pick.illust.pid, title: pick.illust.title, artist: pick.illust.artist,
+      tags: pick.illust.tags, uploadDate: pick.illust.uploadDate, bookmarks: pick.illust.bookmarks, localPath: sendPath,
+    });
+  }
+
+  /** 运行告警私聊发给所有管理员。没连上 NapCat 返回 false（稍后重试） */
+  private async sendAdminAlert(text: string): Promise<boolean> {
+    if (!this.isWsOpen()) return false;
+    const admins = this.access.adminIds().filter(id => /^\d{5,12}$/.test(id) && id !== this.selfId);
+    if (admins.length === 0) return true;
+    let any = false;
+    this.sendingAlert = true;
+    try {
+      for (const id of admins) {
+        try {
+          await this.sendMessageRaw('c2c', id, escapeCqText(text));
+          any = true;
+        } catch (err) {
+          console.warn(`[Health] alert to ${id} failed:`, err instanceof Error ? err.message : err);
+        }
+      }
+    } finally {
+      this.sendingAlert = false;
+    }
+    return any;
+  }
+
+  /** 适配器这边的状态，写进 diag.json 和 /diag */
+  private healthExtra(): Record<string, unknown> {
+    const procs = (Object.keys(this.managers) as AgentTier[])
+      .map(t => `${t} ${this.managers[t].getActiveProcessCount()}/${this.managers[t].getSessionCount()}`).join('，');
+    const net = defaultPixivService.networkState();
+    return {
+      'agy 进程（运行中/会话）': procs,
+      'Pixiv 联网': net.circuitBreakUntil > Date.now() ? `熔断中，到 ${hhmm(net.circuitBreakUntil)}` : `正常（连续失败 ${net.consecutiveFailures} 次）`,
+      '待发提醒': this.reminders.size,
+      '每日一图': this.daily ? `${this.daily.enabledCount()} 个会话开通` : '已关闭',
+    };
+  }
+
+  /** 管理员私聊提示词里的运行状况：最近 30 分钟有异常才带 */
+  private healthBlock(): string {
+    const s = this.health.recentSummary();
+    return s
+      ? `[运行状况（程序记录的最近 30 分钟异常；TA 问起机器人自身的问题时以此为准，详细见 ~/.dsh-qqbot/diag.json 和 events.jsonl，查不到就说查不到）：${s}]\n`
+      : '';
+  }
+
   private async handleCommand(
     scope: 'c2c' | 'group',
     targetId: string,
@@ -1140,6 +1409,9 @@ export class NapCatOneBotAdapter {
           '',
           '- 直接发消息即可聊天；',
           '- 申请图片：直接说「来张信浓」，或 `/pixiv <关键词> [数量]`；',
+          '- 图片反馈：引用我发的图说「好看」「不喜欢」「拉黑这个画师」，以后找图会参考；`/prefs` 查看，`/prefs reset` 清空；',
+          '- 提醒：`/remind 10分钟后 喝水`、`/remind 明天8点 开会`，或者直接跟我说「明早八点叫我」；`/reminders` 查看，`/remind del 编号` 删除；',
+          '- `/daily on [HH:MM]|off|status`：每日一图，每天推一张 Pixiv 日榜插画（群里由群主/管理员开通，默认 12:00）；',
           '- `/clear`：清空当前会话记忆，开启新对话；',
           '- `/proactive on|off|status`：群里由群主/管理员开通后，哈gemi 会主动接话、冷场冒泡、叫名字不用 @；私聊里开通则偶尔主动找你；',
           '- `/ping`：健康检查；',
@@ -1148,6 +1420,8 @@ export class NapCatOneBotAdapter {
             '',
             '管理员命令：',
             '- `/status`：会话与运行状态；',
+            '- `/diag`：运行状况自检（内存、OOM、断线、失败记录；群里发会私聊回你）；',
+            '- `/daily now`：立刻推一张每日一图（测试用）；',
             '- `/access`：查看管理员、白名单、黑名单；',
             '- `/whitelist add|remove [group|user] [ID]`：白名单（该会话的灰名单内容生效）；',
             '- `/blacklist add|remove [group|user] [ID]`：黑名单（该会话的 R-18 等灰名单按黑名单处理）；',
@@ -1291,6 +1565,162 @@ export class NapCatOneBotAdapter {
         return true;
       }
 
+      case '/remind':
+      case '/reminders': {
+        const sub = parts[1]?.toLowerCase();
+        const usage = '用法：`/remind 10分钟后 喝水`、`/remind 明天8点 开会`、`/remind 11-08 20:00 看直播`；`/reminders` 查看，`/remind del 编号` 删除。也可以直接跟我说「明早八点叫我起床」。';
+        if (cmd === '/reminders' || sub === 'list' || sub === 'ls') {
+          // 群里只列 TA 在这个群设的；私聊列 TA 全部的（都是 TA 自己的）
+          const mine = scope === 'group' ? this.reminders.listFor(userId, scope, targetId) : this.reminders.listFor(userId);
+          if (mine.length === 0) {
+            await this.sendReply(scope, targetId, `你在${scope === 'group' ? '这个群' : '这里'}还没有待提醒的事。\n${usage}`, replyMsgId);
+            return true;
+          }
+          const lines = mine.map(r => `- [${r.id}] ${formatWhen(r.dueAt)} ${escapeCqText(r.text)}${scope === 'c2c' && r.scope === 'group' ? '（群里）' : ''}`);
+          await this.sendReply(scope, targetId, `⏰ 你的提醒：\n${lines.join('\n')}\n删除：/remind del 编号`, replyMsgId);
+          return true;
+        }
+        if (sub === 'del' || sub === 'rm' || sub === 'cancel' || sub === '删除' || sub === '取消') {
+          const id = parts[2] ?? '';
+          const removed = /^[0-9a-f]{4}$/i.test(id) ? this.reminders.remove(userId, id, this.access.isAdmin(userId)) : null;
+          await this.sendReply(scope, targetId, removed
+            ? `✅ 删掉了：${formatWhen(removed.dueAt)} ${escapeCqText(removed.text)}`
+            : '没找到这个编号的提醒（/reminders 看看编号）。', replyMsgId);
+          return true;
+        }
+        const body = cmdText.trim().slice(parts[0]!.length).trim();
+        const when = body ? parseWhen(body) : null;
+        if (!when) {
+          await this.sendReply(scope, targetId, body ? `时间没看懂…\n${usage}` : usage, replyMsgId);
+          return true;
+        }
+        const res = this.reminders.add({ scope, targetId, userId, text: when.rest, dueAt: when.at });
+        if (!res.ok) {
+          await this.sendReply(scope, targetId, `⏰ 提醒没设上：${res.error}`, replyMsgId);
+          return true;
+        }
+        console.log(`[Reminders] ${userId} in ${scope}:${targetId} -> ${res.reminder.id} at ${new Date(res.reminder.dueAt).toISOString()} (command)`);
+        await this.sendReply(scope, targetId, `⏰ 好，${formatWhen(res.reminder.dueAt)} 提醒你：${escapeCqText(res.reminder.text)}（编号 ${res.reminder.id}）`, replyMsgId);
+        return true;
+      }
+
+      case '/prefs': {
+        const chatKey = `${scope}:${targetId}`;
+        const action = parts[1]?.toLowerCase();
+        const prefs = defaultPixivService.prefs;
+        const canManage = scope === 'c2c' || this.access.isAdmin(userId) || senderRole === 'owner' || senderRole === 'admin';
+        if (action === 'reset' || action === 'clear') {
+          if (!canManage) {
+            await this.sendReply(scope, targetId, '⛔ 群里的找图偏好只有群主/群管理员能清空哦。', replyMsgId);
+            return true;
+          }
+          const had = prefs.reset(chatKey);
+          console.log(`[Prefs] ${chatKey} reset by ${userId}`);
+          await this.sendReply(scope, targetId, had ? '✅ 这里的找图偏好清空了，从头记起。' : '这里本来就没有记下什么偏好。', replyMsgId);
+          return true;
+        }
+        if (action === 'unblock') {
+          const name = cmdText.trim().replace(/^\/prefs\s+unblock\s*/i, '').trim();
+          const ok = name ? prefs.unblockArtist(chatKey, name) : false;
+          await this.sendReply(scope, targetId, ok
+            ? `✅ 「${escapeCqText(name)}」的图又可以发了。`
+            : `没在不发的名单里找到「${escapeCqText(name || '（没写画师名）')}」。发 /prefs 看看名单。`, replyMsgId);
+          return true;
+        }
+        const s = prefs.summary(chatKey);
+        if (!s) {
+          await this.sendReply(scope, targetId, '这里还没有找图偏好。引用我发的图说「好看」「不喜欢」或「拉黑这个画师」，我就会记下来，以后找图参考。', replyMsgId);
+          return true;
+        }
+        const list = (a: string[]): string => escapeCqText(a.join('、'));
+        const lines = [
+          `🎨 ${scope === 'group' ? '本群' : '你'}的找图偏好`,
+          `- 反馈：👍 ${s.likes} 次 · 👎 ${s.dislikes} 次`,
+          s.likedArtists.length ? `- 偏爱的画师：${list(s.likedArtists)}` : '',
+          s.likedTags.length ? `- 偏爱的标签：${list(s.likedTags)}` : '',
+          s.dislikedArtists.length || s.dislikedTags.length ? `- 不太喜欢：${list([...s.dislikedArtists, ...s.dislikedTags])}` : '',
+          s.blockedArtists.length ? `- 不发的画师：${list(s.blockedArtists)}（/prefs unblock 画师名 恢复）` : '',
+          '引用我发的图说「好看」「不喜欢」「拉黑这个画师」就能调整；/prefs reset 清空。',
+        ].filter(Boolean);
+        await this.sendReply(scope, targetId, lines.join('\n'), replyMsgId);
+        return true;
+      }
+
+      case '/daily': {
+        if (!this.daily) {
+          await this.sendReply(scope, targetId, '每日一图当前未开启（由管理员全局控制）。', replyMsgId);
+          return true;
+        }
+        const action = parts[1]?.toLowerCase();
+        const usage = '用法：`/daily on [HH:MM]`（默认 12:00，北京时间）、`/daily off`、`/daily status`';
+        const canManage = scope === 'c2c' || this.access.isAdmin(userId) || senderRole === 'owner' || senderRole === 'admin';
+        if (action === 'on' || action === 'off') {
+          if (!canManage) {
+            await this.sendReply(scope, targetId, '⛔ 只有群主/群管理员能开关每日一图哦。', replyMsgId);
+            return true;
+          }
+          let time: string | undefined;
+          if (action === 'on' && parts[2]) {
+            const t = normalizeDailyTime(parts[2]);
+            if (!t) {
+              await this.sendReply(scope, targetId, `时间格式不对，例：/daily on 12:30\n${usage}`, replyMsgId);
+              return true;
+            }
+            time = t;
+          }
+          const sub = this.daily.set(scope, targetId, action === 'on', userId, time);
+          console.log(`[DailyPush] ${scope}:${targetId} -> ${action} ${sub.time} by ${userId}`);
+          await this.sendReply(scope, targetId, action === 'on'
+            ? `✅ 每日一图开啦：每天 ${sub.time}（北京时间）推一张 Pixiv 日榜插画${sub.lastDate === cstDate(Date.now()) ? '，今天的时间已经过了，从明天开始' : ''}。改时间发 /daily on HH:MM，不要了发 /daily off。`
+            : '好～每日一图关掉了，想要了再 /daily on。', replyMsgId);
+          return true;
+        }
+        if (action === 'now') {
+          if (!this.access.isAdmin(userId)) {
+            await this.sendReply(scope, targetId, '⛔ 该命令仅管理员可用。', replyMsgId);
+            return true;
+          }
+          try {
+            const pick = await defaultPixivService.pickRanking(`${scope}:${targetId}`, { mode: 'day' });
+            if (!pick) {
+              await this.sendReply(scope, targetId, '日榜里没有能发的图了（都发过或不合规）。', replyMsgId);
+              return true;
+            }
+            await this.sendDailyPick(scope, targetId, pick);
+            this.daily.markPushed(scope, targetId);
+          } catch (err) {
+            await this.reportFailure(scope, targetId, err, replyMsgId);
+          }
+          return true;
+        }
+        const sub = this.daily.get(scope, targetId);
+        const status = !sub ? '每日一图：未开通'
+          : sub.enabled ? `每日一图：已开通，每天 ${sub.time} 推送${sub.lastDate === cstDate(Date.now()) ? '（今天的已经推过/已过时间）' : ''}`
+            : '每日一图：已关闭';
+        await this.sendReply(scope, targetId, `${status}\n${usage}`, replyMsgId);
+        return true;
+      }
+
+      case '/diag': {
+        if (!this.access.isAdmin(userId)) {
+          await this.sendReply(scope, targetId, '⛔ 该命令仅管理员可用。', replyMsgId);
+          return true;
+        }
+        const text = escapeCqText(this.health.diagText());
+        // 服务器内部状况不在群里公开（AGENTS.md §8）：群里发的话私聊回给管理员
+        if (scope === 'group') {
+          try {
+            await this.sendMessageRaw('c2c', userId, text);
+            await this.sendReply(scope, targetId, '运行状况私聊发你了～', replyMsgId);
+          } catch (err) {
+            await this.reportFailure(scope, targetId, err, replyMsgId);
+          }
+          return true;
+        }
+        await this.sendReply(scope, targetId, text, replyMsgId);
+        return true;
+      }
+
       case '/pixiv': {
         const rawTokens = parts.slice(1);
         if (rawTokens.length === 0) {
@@ -1326,8 +1756,9 @@ export class NapCatOneBotAdapter {
     expressionChance = this.expressionChance,
   ): Promise<void> {
     const cwd = this.config.antigravity?.cwd || process.cwd();
-    // 先取出情绪标记 [表情:xxx]，再抽媒体、整形
-    const { clean: exprStripped, expression } = extractExpression(rawText);
+    // 先抹掉提醒标记（建提醒只在用户发起的回合里做，见 applyReminderMarkers；主动消息/插话里的标记只删不建），
+    // 再取出情绪标记 [表情:xxx]，再抽媒体、整形
+    const { clean: exprStripped, expression } = extractExpression(extractReminderMarkers(rawText).clean);
     const { cleanedText, filesToSend } = extractOutboundMedia(exprStripped, cwd);
 
     // 图片 >5MB 先降噪压缩；成品与原图并存，发送用成品
@@ -1463,6 +1894,9 @@ export class NapCatOneBotAdapter {
         }
         if (attempt < attempts) await sleep(this.sendRetryDelayMs * attempt);
       }
+    }
+    if (!this.sendingAlert) {
+      this.health.noteSendFailure(`${scope}:${targetId}`, `${message.includes('[CQ:image') ? '图片' : '文字'}消息，${last instanceof Error ? last.message : String(last)}`.slice(0, 200));
     }
     throw new NapCatSendError(this.sendRetries, last, message.includes('[CQ:image'));
   }

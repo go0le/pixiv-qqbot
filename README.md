@@ -33,8 +33,12 @@
 - **找图**：明文要图走快速通道（`src/pixiv/`）；Agent 里用 [pixiv-mcp](https://github.com/go0le/pixiv-mcp)。两边共用同一份「已发 PID」记录（`PIXIV_HISTORY_FILE`），同一个会话不重复出图。灰名单（R-18 等）按会话白/黑名单控制。
 - **记忆**：[MemoryOS 的 hagemi 分支](https://github.com/go0le/MemoryOS/tree/hagemi)，基于 [BAI-LAB/MemoryOS](https://github.com/BAI-LAB/MemoryOS)。机器人按 QQ 号存取记忆，群聊和私聊分开存，模型碰不到别人的记忆。召回逻辑在 `src/antigravity/memory-client.ts`。
 - **群聊**：在开通了主动模式的群里（`@她 /proactive on`）会接话、冷场时冒泡，叫名字不用 @。引用她发过的图时，她知道那张图是什么。
+- **提醒**（所有人可用）：`/remind 10分钟后 喝水`、`/remind 明天8点 开会`、`/reminders`，或者直接说「明早八点叫我」。模型在回复里写 `[提醒:时间|内容]` 标记，由程序绑定到发消息的本人和当前会话，到点群里 @ TA（`src/antigravity/reminders.ts`）。
+- **图片反馈**：引用她发的图说「好看」「不喜欢」「拉黑这个画师」，记进这个会话的找图偏好，之后的搜图会去掉拉黑的画师、按偏好调整先后（不放宽任何过滤）。快速通道和 pixiv-mcp 共用 `PIXIV_PREFS_FILE`；`/prefs` 查看。
+- **每日一图**：群主/群管理员 `@她 /daily on [HH:MM]`，每天推一张 Pixiv 日榜插画（`src/antigravity/daily-push.ts`）。
+- **运行状况自检**：每分钟采样内存、内核 OOM 次数、磁盘，记录进程意外退出、NapCat 断线、回合和发送失败；异常时私聊告警管理员，写 `~/.dsh-qqbot/diag.json` 和 `events.jsonl`，管理员可以 `/diag`。被问起机器人自身的问题时，她按这些记录回答（`src/antigravity/health.ts`）。
 - **表情贴图**：回复里的 `[表情:名]` 会换成 `persona/expressions/` 里的贴图，默认 30% 的概率附图（`NAPCAT_EXPRESSION_CHANCE`）。
-- **稳定性**：会挂起整轮的工具（如 `schedule`）会被打断并改用系统定时任务；回复写完但这一轮迟迟不结束时，先把回复发出去；超时后排队的消息不会丢；发送回执超时会先确认消息有没有发出去，再决定是否重发。
+- **稳定性**：会挂起整轮的工具（如 `schedule`）会被打断（给用户的提醒改用上面的提醒标记）；回复写完但这一轮迟迟不结束时，先把回复发出去；超时后排队的消息不会丢；发送回执超时会先确认消息有没有发出去，再决定是否重发。
 
 运行（需要 Node ≥ 20、已登录的 `agy`、NapCat 开启正向 WebSocket）：
 

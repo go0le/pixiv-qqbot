@@ -99,6 +99,12 @@ export class AccessStore {
     return this.data.admins.includes(String(userId));
   }
 
+  /** 全部管理员 QQ 号（运行告警私聊发给他们） */
+  public adminIds(): string[] {
+    this.reload();
+    return [...this.data.admins];
+  }
+
   public roleOf(userId: string | number): Role {
     return this.isAdmin(userId) ? 'admin' : 'user';
   }

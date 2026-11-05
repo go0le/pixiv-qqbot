@@ -58,9 +58,12 @@ import {
   type SearchAuth,
 } from './auth.ts';
 import { buildIllustrationSearchUrl, extractSearchWorks, mapSearchWork } from './parse.ts';
+import { PixivPrefsStore, resolvePrefsFile } from './prefs.ts';
 
 /** 富媒体缓存目录 */
 export const PIXIV_MEDIA_DIR = resolve(homedir(), '.dsh-qqbot', 'media');
+/** 按会话的搜图偏好（QQ 机器人写，各 pixiv MCP 只读）：PIXIV_PREFS_FILE，默认和共享的已发历史放在一起 */
+export const PIXIV_PREFS_FILE = resolvePrefsFile(resolve(homedir(), '.dsh-qqbot', 'pixiv-shared', 'pixiv_prefs.json'));
 /** 本地元数据缓存文件 */
 export const PIXIV_METADATA_FILE = resolve(homedir(), '.dsh-qqbot', 'pixiv_metadata.json');
 /** 动态自学习标签映射存储文件 */
@@ -166,7 +169,12 @@ export interface PixivServiceConfig {
   rateLimiter?: PixivRateLimiter;
   timeoutMs?: number;
   config?: PixivConfig;
+  /** 偏好文件；null = 只在内存里（测试用）；不传用 PIXIV_PREFS_FILE */
+  prefsFile?: string | null;
 }
+
+/** 排行榜候选的缓存时长：日榜一天才更新一次，多个群同一时间推送时只请求一次 */
+const RANKING_CACHE_MS = 30 * 60_000;
 
 export class PixivService {
   private readonly mediaDir: string;
@@ -181,6 +189,8 @@ export class PixivService {
   private readonly chatMutex = new KeyedMutex();
   private readonly pixivAuth = new PixivAuth();
   private readonly cleanupFn: () => void;
+  private readonly prefsStore: PixivPrefsStore;
+  private readonly rankingCache = new Map<string, { at: number; items: Array<PixivIllustration & { rank: number }> }>();
 
   private metadataMap: Map<string, CachedPixivMetadata> = new Map();
 
@@ -202,6 +212,7 @@ export class PixivService {
     this.history = config.historyManager || defaultPixivHistory;
     this.limiter = config.rateLimiter || defaultPixivLimiter;
     this.timeoutMs = config.timeoutMs ?? 15000;
+    this.prefsStore = new PixivPrefsStore(config.prefsFile === undefined ? PIXIV_PREFS_FILE : config.prefsFile);
     this.ensureDirs();
     this.cleanStaleTemps();
     this.loadMetadata();
@@ -229,6 +240,16 @@ export class PixivService {
 
   public get llmResolver(): LlmTagResolver {
     return this.llmTagResolver;
+  }
+
+  /** 按会话的搜图偏好（反馈、拉黑画师） */
+  public get prefs(): PixivPrefsStore {
+    return this.prefsStore;
+  }
+
+  /** 联网状态（给运行状况自检用）：连续失败次数、熔断到什么时候 */
+  public networkState(): { consecutiveFailures: number; circuitBreakUntil: number } {
+    return { consecutiveFailures: this.consecutiveFailures, circuitBreakUntil: this.circuitBreakUntil };
   }
 
   private ensureDirs(): void {
@@ -952,7 +973,9 @@ export class PixivService {
       return Array.from(best.values());
     };
     localMatches.sort((a, b) => b.score - a.score);
-    const uniqueLocal = dedupeByPid(localMatches);
+    // 按会话偏好：去掉拉黑的画师/作品，综合分乘偏好系数（搜索词本身不参与），再重新排序
+    const uniqueLocal = this.prefsStore.apply(chatKey, dedupeByPid(localMatches), resolvedTags);
+    uniqueLocal.sort((a, b) => b.score - a.score);
     localMatches.length = 0;
     localMatches.push(...uniqueLocal);
 
@@ -997,6 +1020,7 @@ export class PixivService {
           Math.max(1, targetCount - goodLocal.length) + 2,
           new Set([...sentPids, ...localMatches.map(m => m.pid)]),
         );
+        fetchedIllusts = this.prefsStore.apply(chatKey, fetchedIllusts, resolvedTags);
         this.consecutiveFailures = 0; // 成功重置计数
       } catch {
         this.consecutiveFailures += 1;
@@ -1029,7 +1053,7 @@ export class PixivService {
     if (candidateList.length === 0) {
       if (this.history.canReset(chatKey)) {
         // 只让「本次检索范围内」的作品重新可发；不清掉这个会话其它标签的已发记录
-        const pool = dedupeByPid([...allLocalForTag, ...fetchedIllusts]);
+        const pool = dedupeByPid([...this.prefsStore.apply(chatKey, allLocalForTag, resolvedTags), ...fetchedIllusts]);
         this.history.forget(chatKey, pool.map(p => p.pid));
         exhaustedReset = true;
         for (const item of pool) {
@@ -1493,6 +1517,129 @@ export class PixivService {
       if (pool.size === 0) throw err;
     }
     return Array.from(pool.values());
+  }
+
+  /**
+   * 每日一图：从 Pixiv 排行榜（默认日榜）里给这个会话挑一张没发过、合规、合偏好的插画，下载好并记进已发历史。
+   * 只看全年龄榜，灰名单一律不放行（白名单会话也一样）；名次靠前的优先，偏好只在相近名次之间调整先后。
+   * 没有可发的返回 null；网络错误照常抛出。
+   */
+  public async pickRanking(
+    chatKey: string,
+    opts: { mode?: 'day' | 'week'; maxRank?: number } = {},
+  ): Promise<{ illust: PixivIllustration; rank: number; mode: 'day' | 'week' } | null> {
+    const mode = opts.mode ?? 'day';
+    const maxRank = Math.max(1, Math.min(50, Math.floor(opts.maxRank ?? 30)));
+    return this.chatMutex.runExclusive(chatKey, async () => {
+      const ranked = await this.fetchRanking(mode);
+      const sent = this.getSentPids(chatKey);
+      // 名次分：第 1 名 1.0，第 15 名约 0.64；乘上偏好系数后排序
+      const pool = ranked
+        .filter(it => it.rank <= maxRank && !sent.has(it.pid))
+        .map(it => ({ ...it, score: 1 / (1 + 0.04 * (it.rank - 1)) }));
+      const candidates = this.prefsStore.apply(chatKey, pool, []).sort((a, b) => b.score - a.score || a.rank - b.rank);
+      let attempts = 0;
+      for (const item of candidates) {
+        if (attempts >= 3) break;
+        if (!item.originalUrl) continue;
+        attempts++;
+        try {
+          const localPath = await this.downloadOriginalImage(item.pid, item.originalUrl, 0);
+          this.metadataMap.set(`${item.pid}_p0`, {
+            pid: item.pid,
+            title: item.title,
+            artist: item.artist,
+            tags: item.tags,
+            bookmarks: item.bookmarks,
+            uploadDate: item.uploadDate,
+            filePath: localPath,
+            originalUrl: item.originalUrl,
+            cachedAt: Date.now(),
+            page: 0,
+            illustType: item.illustType ?? 0,
+            xRestrict: Number(item.xRestrict ?? 0),
+            aiType: item.aiType,
+          });
+          this.saveMetadata();
+          this.recordSent(chatKey, [item.pid]);
+          const { rank, ...illust } = item;
+          return { illust: { ...illust, localPath }, rank, mode };
+        } catch (err) {
+          console.warn(`[PixivService] ranking pick pid=${item.pid} download failed: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+      return null;
+    });
+  }
+
+  /** 排行榜第一页（30 条）里合规的插画，带名次。有 refresh token 走 app-api，否则走网页 ranking.php */
+  private async fetchRanking(mode: 'day' | 'week'): Promise<Array<PixivIllustration & { rank: number }>> {
+    const hit = this.rankingCache.get(mode);
+    if (hit && Date.now() - hit.at < RANKING_CACHE_MS) return hit.items;
+    const auth = await this.buildSearchAuth();
+    let rows: Record<string, unknown>[];
+    if (auth.appApi) {
+      rows = extractSearchWorks(await this.fetchJson(`https://app-api.pixiv.net/v1/illust/ranking?mode=${mode}&filter=for_android`, auth.headers));
+    } else {
+      const origin = (auth.proxyBaseUrl || 'https://www.pixiv.net').replace(/\/$/, '');
+      const json = await this.fetchJson(`${origin}/ranking.php?mode=${mode === 'day' ? 'daily' : 'weekly'}&content=illust&format=json&p=1`, auth.headers) as { contents?: unknown };
+      const contents = Array.isArray(json?.contents) ? json.contents as Record<string, unknown>[] : [];
+      rows = contents.map(c => {
+        const ct = (c.illust_content_type ?? {}) as Record<string, unknown>;
+        const flagged = ['bl', 'furry', 'grotesque', 'homosexual'].some(k => ct[k] === true) || Number(ct.sexual ?? 0) > 0;
+        return {
+          id: c.illust_id,
+          title: c.title,
+          userName: c.user_name,
+          tags: c.tags,
+          url: c.url,
+          createDate: typeof c.illust_upload_timestamp === 'number' ? new Date(c.illust_upload_timestamp * 1000).toISOString() : undefined,
+          illustType: Number(c.illust_type ?? 0),
+          xRestrict: flagged ? 1 : 0,
+          aiType: c.illust_ai_type ?? 0,
+        };
+      });
+    }
+    const items: Array<PixivIllustration & { rank: number }> = [];
+    rows.forEach((row, i) => {
+      const mapped = mapSearchWork(row, false);
+      if (!mapped || mapped.illustType !== 0) return;
+      const meta: CachedPixivMetadata = {
+        pid: mapped.pid,
+        title: mapped.title,
+        artist: mapped.artist,
+        tags: mapped.tags,
+        bookmarks: mapped.bookmarks,
+        uploadDate: mapped.uploadDate,
+        filePath: '',
+        originalUrl: mapped.originalUrl ?? '',
+        cachedAt: 0,
+        page: 0,
+        illustType: mapped.illustType,
+        xRestrict: mapped.xRestrict,
+        aiType: mapped.aiType,
+      };
+      if (!isImageCompliant(meta, '', new Set()).compliant) return;
+      items.push({
+        pid: mapped.pid,
+        title: mapped.title,
+        artist: mapped.artist,
+        localPath: '',
+        score: 0,
+        bookmarks: mapped.bookmarks,
+        uploadDate: mapped.uploadDate,
+        tags: mapped.tags,
+        originalUrl: mapped.originalUrl,
+        isFromCache: false,
+        page: 0,
+        illustType: mapped.illustType,
+        xRestrict: mapped.xRestrict,
+        aiType: mapped.aiType,
+        rank: i + 1,
+      });
+    });
+    if (items.length > 0) this.rankingCache.set(mode, { at: Date.now(), items });
+    return items;
   }
 
   /**

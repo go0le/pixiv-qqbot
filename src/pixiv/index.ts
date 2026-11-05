@@ -6,4 +6,5 @@ export * from './history.ts';
 export * from './limiter.ts';
 export * from './dynamic-store.ts';
 export * from './llm-resolver.ts';
+export * from './prefs.ts';
 export * from './service.ts';

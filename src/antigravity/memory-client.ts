@@ -21,6 +21,8 @@ export class MemoryClient {
   private readonly pending = new Map<number, Pending>();
   private queue: Promise<unknown> = Promise.resolve();
   private failedUntil = 0;
+  /** 记忆库进程退出时回调（运行状况自检用）。expected = dispose() 主动结束的 */
+  public onExit: ((code: number | null, signal: NodeJS.Signals | null, expected: boolean) => void) | null = null;
 
   public constructor(private readonly launcher = DEFAULT_MEMORY_LAUNCHER) {}
 
@@ -51,7 +53,12 @@ export class MemoryClient {
         this.failedUntil = Date.now() + 30_000; // 30 秒内不再反复拉起
       };
       child.on('error', e => { fail(e); reject(e); });
-      child.on('exit', code => fail(new Error(`memoryos exited (${code})`)));
+      child.on('exit', (code, signal) => {
+        // dispose() 会先把 this.child 置空再结束进程：那种退出是预期的，也不能清掉之后新拉起的进程
+        const current = this.child === child;
+        if (current) fail(new Error(`memoryos exited (${code ?? signal})`));
+        try { this.onExit?.(code, signal, !current); } catch { /* ignore */ }
+      });
       this.rpc('initialize', {
         protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'napcat-adapter', version: '1' },
       }, 90_000).then(() => {

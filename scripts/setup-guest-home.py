@@ -27,9 +27,11 @@ WRAPPER_DIR = MAIN_HOME / '.hagemi-wrappers'
 OAUTH_SRC = MAIN_HOME / '.gemini' / 'antigravity-cli' / 'antigravity-oauth-token'
 # 所有搜图途径共用的「已发过的 PID」记录：软路由（机器人自己）、管理员 agy、访客 agy 的 pixiv MCP。
 # 同一个群不管走哪条路都不重复发图（2026-11-05 某群：访客 MCP 的记录和软路由分开，同一张蕾姆发了两次）。
-# 目录里只有这一个文件，以读写方式绑进访客沙箱；文件是原子写（同目录 tmp + rename），所以必须绑目录而不是文件。
+# 目录里放已发历史和找图偏好两个文件，以读写方式绑进访客沙箱；文件是原子写（同目录 tmp + rename），所以必须绑目录而不是文件。
 PIXIV_SHARED_DIR = MAIN_HOME / '.dsh-qqbot' / 'pixiv-shared'
 PIXIV_SHARED_HISTORY = PIXIV_SHARED_DIR / 'pixiv_history.json'
+# 按会话的找图偏好（喜欢/不喜欢/拉黑画师）：机器人写，各 pixiv MCP 只读，和已发历史放在同一个共享目录
+PIXIV_SHARED_PREFS = PIXIV_SHARED_DIR / 'pixiv_prefs.json'
 
 
 def agy_bin() -> str:
@@ -149,6 +151,17 @@ COMMON = """# 人设：哈Gemi（Gemini 娘）· 访客模式
 ## 会话标识
 
 每条用户消息开头有 `[会话标识：xxx]`。调用 pixiv 工具时，把 `session` 参数设为这个值（原样）。回复里不要提到任何标识。
+
+## 提醒
+
+用户让你到时间提醒 TA（「明早八点叫我起床」「半小时后提醒我收衣服」）时，在回复里另起一行写一个标记：`[提醒:2026-11-06 08:00|起床]`。
+时间是北京时间，按消息开头的 `[当前时间]` 算，也可以写 `[提醒:30分钟后|收衣服]`。程序会取出标记、到点在这里提醒 TA，并在你的回复后面附上确认。
+**不写标记就不会提醒**，不要只口头答应；只能提醒发消息的本人。这不算「定时任务」，普通用户也可以用。用户也可以自己发 `/remind`、`/reminders` 管理。
+
+## 其它
+
+- 用户引用你发的图说「好看」「不喜欢」「拉黑这个画师」时，程序会自动记下找图偏好（消息里会有 `[程序已按 TA 的反馈记下…]`），自然回应一句就好；想看偏好让 TA 发 `/prefs`。
+- 被问到「刚才怎么没回」「是不是卡了」之类你自己运行上的问题，你看不到服务器的情况，就如实说不清楚、请 TA 再发一次，不要编原因。
 """
 
 GREY_DENY = """
@@ -185,6 +198,7 @@ def build(home: Path, grey_allowed: bool) -> None:
     # 沙箱里 /home 被 tmpfs 隐藏，MIKU 的 ~/.pixiv-mcp 不可见；让访客 pixiv 的数据落在访客 HOME 内。
     env['PIXIV_MCP_HOME'] = str(home / '.pixiv')
     env['PIXIV_HISTORY_FILE'] = str(PIXIV_SHARED_HISTORY)
+    env['PIXIV_PREFS_FILE'] = str(PIXIV_SHARED_PREFS)
     if grey_allowed:
         env.pop('PIXIV_GREY_POLICY', None)
     else:
