@@ -1,9 +1,21 @@
 node_modules/
 dist/
+docs/
 lib/
-uploads/
-*.log
-.DS_Store
-
 .env
+.env.qqbot
+.dsh-sessions/
+*.tsbuildinfo
+cordis.dev.yml
+# 运行时数据与私有文件，不进仓库
 .env.*
+!.env.example
+*.db
+*.db-*
+.backup/
+handoff-*/
+review-*/
+HANDOFF-*.md
+FIX-*.md
+*.tgz
+w.json

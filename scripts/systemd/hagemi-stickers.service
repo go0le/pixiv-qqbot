@@ -1,0 +1,18 @@
+[Unit]
+Description=哈Gemi 表情包补全：图片额度恢复后继续生成，直到配齐（scripts/sticker-cycle.py）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=MIKU
+Group=MIKU
+WorkingDirectory=/home/MIKU/dsh-qqbot
+Environment="HOME=/home/MIKU"
+Environment="PATH=/home/MIKU/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/MIKU/external/MemoryOS/.venv/bin/python /home/MIKU/dsh-qqbot/scripts/sticker-cycle.py
+# 一轮最多：试探 1 张 + 补齐其余（并发 2，每张 ≤400s）+ 等机器人空闲最多 20 分钟
+TimeoutStartSec=3h
+Nice=10
+# 生成只需要 agy + pixiv MCP（约 1GB）；封顶 2G，出意外也只会杀掉这一轮，不会挤爆机器人
+MemoryMax=2G

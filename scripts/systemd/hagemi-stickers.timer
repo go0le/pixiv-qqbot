@@ -1,0 +1,9 @@
+[Unit]
+Description=每小时尝试补全哈Gemi 表情包（配齐后 sticker-cycle.py 会自己停掉本定时器）
+
+[Timer]
+OnCalendar=*-*-* *:07:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

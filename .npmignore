@@ -1,0 +1,10 @@
+src/
+dev.ts
+cordis.dev.yml
+tsconfig.json
+docs/
+.env
+.env.example
+.dsh-sessions/
+*.tsbuildinfo
+node_modules/

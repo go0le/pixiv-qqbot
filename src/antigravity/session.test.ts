@@ -330,12 +330,12 @@ describe('Antigravity Media Prompt Integration', () => {
     const { extractOutboundMedia } = await import('./media.ts');
     const path = await import('node:path');
 
-    const sample = '查看详情见文档 [v3.md](file:///home/yhljzgt233/dsh-qqbot/v3.md) 以及代码 [bot.ts](file:///home/yhljzgt233/dsh-qqbot/src/antigravity/bot.ts#L10-L20)。';
+    const sample = '查看详情见文档 [v3.md](file:///home/user/dsh-qqbot/v3.md) 以及代码 [bot.ts](file:///home/user/dsh-qqbot/src/antigravity/bot.ts#L10-L20)。';
     const result = extractOutboundMedia(sample);
 
     expect(result.filesToSend).toEqual([]);
     expect(result.cleanedText).toBe('查看详情见文档 v3.md 以及代码 bot.ts。');
     expect(result.cleanedText).not.toContain('file://');
-    expect(result.cleanedText).not.toContain('/home/yhljzgt233');
+    expect(result.cleanedText).not.toContain('/home/user');
   });
 });

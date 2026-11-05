@@ -16,6 +16,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -27,7 +28,9 @@ import { AsyncMutex } from './mutex.ts';
 export const MAX_HISTORY_PER_CHAT = 500;
 
 /** 默认持久化文件路径 */
-export const DEFAULT_HISTORY_FILE = resolve(homedir(), '.dsh-qqbot', 'pixiv_history.json');
+export const DEFAULT_HISTORY_FILE = process.env.PIXIV_HISTORY_FILE
+  ? resolve(process.env.PIXIV_HISTORY_FILE)
+  : resolve(homedir(), '.dsh-qqbot', 'pixiv_history.json');
 
 /** 历史重置默认冷却时间（毫秒） */
 export const DEFAULT_RESET_COOLDOWN_MS = 120_000;
@@ -38,6 +41,8 @@ export class PixivHistoryManager {
   private readonly maxPerChat: number;
   private historyMap: Map<string, string[]> = new Map();
   private lastResetMap: Map<string, number> = new Map();
+  /** 上次读/写磁盘文件时的 mtime。多个进程（napcat 适配器、各 agy 会话的 MCP）可以共用同一个历史文件 */
+  private lastDiskMtimeMs = 0;
   private readonly mutex = new AsyncMutex();
 
   // 脏标记与防抖刷盘控制 (P1-02)
@@ -93,12 +98,38 @@ export class PixivHistoryManager {
   }
 
   /**
+   * 把磁盘文件里别的进程写入的记录并进内存（并集，文件里的顺序在前）。
+   * 文件没变化（mtime 相同）时什么都不做。
+   */
+  private mergeFromDisk(): void {
+    try {
+      if (!existsSync(this.filePath)) return;
+      const mtime = statSync(this.filePath).mtimeMs;
+      if (mtime === this.lastDiskMtimeMs) return;
+      const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== 'object') return;
+      for (const [key, val] of Object.entries(parsed)) {
+        if (!Array.isArray(val)) continue;
+        const fromDisk = val.map(String);
+        const mine = this.historyMap.get(key) ?? [];
+        const seen = new Set(fromDisk);
+        const merged = [...fromDisk, ...mine.filter(p => !seen.has(p))];
+        this.historyMap.set(key, merged.slice(-this.maxPerChat));
+      }
+      this.lastDiskMtimeMs = mtime;
+    } catch {
+      // 文件正在被别的进程写入或损坏：沿用内存数据
+    }
+  }
+
+  /**
    * 原子化落盘保存历史数据至磁盘 (tmp -> rename + backup)
    * 包含完善的 tmp 异常清理保护 (P1-06)
    */
-  public saveSync(): void {
+  public saveSync(merge = true): void {
     let tmpPath = '';
     try {
+      if (merge) this.mergeFromDisk();
       const dir = dirname(this.filePath);
       if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
@@ -123,6 +154,7 @@ export class PixivHistoryManager {
       writeFileSync(tmpPath, serialized, 'utf8');
       renameSync(tmpPath, this.filePath);
       this.dirty = false;
+      try { this.lastDiskMtimeMs = statSync(this.filePath).mtimeMs; } catch { /* ignore */ }
     } catch (err) {
       if (tmpPath && existsSync(tmpPath)) {
         try { unlinkSync(tmpPath); } catch { /* ignore */ }
@@ -170,6 +202,7 @@ export class PixivHistoryManager {
    * 查询某个会话是否已发送过特定 PID
    */
   public has(chatKey: string, pid: string): boolean {
+    this.mergeFromDisk();
     const list = this.historyMap.get(chatKey);
     if (!list) return false;
     return list.includes(String(pid));
@@ -183,6 +216,7 @@ export class PixivHistoryManager {
    * 获取某个会话已发送的 PID 列表副本
    */
   public get(chatKey: string): string[] {
+    this.mergeFromDisk();
     const list = this.historyMap.get(chatKey);
     return list ? [...list] : [];
   }
@@ -241,9 +275,28 @@ export class PixivHistoryManager {
    * 清除指定会话的历史记录 (耗尽兜底重置)
    */
   public clear(chatKey: string, now = Date.now()): void {
+    this.mergeFromDisk();
     if (this.historyMap.has(chatKey)) {
       this.historyMap.delete(chatKey);
-      this.flushSync();
+      this.saveSync(false); // 不能再并回磁盘内容，否则刚清掉的记录会被复活
+    }
+    this.lastResetMap.set(chatKey, now);
+  }
+
+  /**
+   * 只让指定的 PID 重新变为「未发送」，保留该会话其它记录。用于某个检索范围发完后的耗尽重置，
+   * 避免一次搜空就把整个群的去重历史清掉。
+   */
+  public forget(chatKey: string, pids: string[], now = Date.now()): void {
+    this.mergeFromDisk();
+    const list = this.historyMap.get(chatKey);
+    if (list && pids.length > 0) {
+      const drop = new Set(pids.map(String));
+      const kept = list.filter(p => !drop.has(p));
+      if (kept.length !== list.length) {
+        this.historyMap.set(chatKey, kept);
+        this.saveSync(false);
+      }
     }
     this.lastResetMap.set(chatKey, now);
   }

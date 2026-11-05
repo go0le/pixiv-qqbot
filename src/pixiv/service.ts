@@ -33,11 +33,14 @@ import { PixivRateLimiter, defaultPixivLimiter } from './limiter.ts';
 import { KeyedMutex } from './mutex.ts';
 import { DynamicTagStore } from './dynamic-store.ts';
 import { LlmTagResolver } from './llm-resolver.ts';
+import { PixivTagOracle } from './tag-oracle.ts';
+import { FEATURE_DICT, peelFeatureWords, peelKnownCompound } from './compound.ts';
 import {
   CHARACTER_TAG_MAP,
   COMMON_ATTR_MAP,
   GREYLIST_CATEGORIES,
   QUALITY_WATERFALL_TIERS,
+  WORK_NAME_PREFIXES,
 } from './constants.ts';
 import {
   checkRequestBlacklist,
@@ -88,6 +91,31 @@ function ensureGlobalShutdownHooks(): void {
   process.on('SIGINT', onShutdown);
   process.on('SIGTERM', onShutdown);
 }
+
+/**
+ * 按真实收藏数分档：0 = ≥10000，1 = ≥5000，2 = ≥1000，3 = ≥500，4 = 更低。
+ * 「users入り」是用户自己加的标签，有人给几十收藏的图也打上 10000users入り（实测 蕾姆 10000 档里有 51 收藏的），
+ * 所以档位按真实收藏数算，而不是按它出现在哪个搜索档里。
+ */
+export function tierOfBookmarks(bookmarks: number): number {
+  if (bookmarks >= 10000) return 0;
+  if (bookmarks >= 5000) return 1;
+  if (bookmarks >= 1000) return 2;
+  if (bookmarks >= 500) return 3;
+  return 4;
+}
+/** 每个质量档最多翻几页（每页 30 条）。前面的档翻完还不够才降档 */
+const TIER_PAGES = Math.max(1, Math.min(5, Number(process.env.PIXIV_TIER_PAGES) || 2));
+/** 「够好」的综合分下限（收藏数 × 时间衰减）。低于它的只在凑不够数时补位 */
+export const MIN_GOOD_SCORE = Math.max(0, Number(process.env.PIXIV_MIN_SCORE ?? 100));
+/**
+ * 本地缓存直出的门槛：本地缓存里够数的候选综合分都达到它，才不联网直接从缓存发。
+ * 否则联网，把缓存和网上的新候选放在一起按综合分挑——缓存里多是以前发过的老图，
+ * 只看缓存会一直发老图（实测「蕾姆」缓存里全是 2021 年的高收藏图，网上有 2023–2024 年分数更高的）。
+ */
+const LOCAL_SHORTCUT_SCORE = Math.max(MIN_GOOD_SCORE, Number(process.env.PIXIV_LOCAL_SHORTCUT_SCORE ?? 1500));
+/** 旧版本把未知收藏数抬成档位门槛写进了缓存，正好等于门槛值的缓存条目视为不可信 */
+const INFLATED_BOOKMARKS = new Set([10000, 5000, 1000, 500]);
 
 /** 半衰期常量: λ = ln(2) / 365 */
 const LAMBDA_DECAY = Math.LN2 / 365;
@@ -146,6 +174,7 @@ export class PixivService {
   private readonly metadataBackupFile: string;
   private readonly dynamicTagStore: DynamicTagStore;
   private readonly llmTagResolver: LlmTagResolver;
+  private readonly tagOracle: PixivTagOracle;
   private readonly history: PixivHistoryManager;
   private readonly limiter: PixivRateLimiter;
   private readonly timeoutMs: number;
@@ -166,6 +195,10 @@ export class PixivService {
     const dynamicFile = config.dynamicTagFile || PIXIV_DYNAMIC_TAGS_FILE;
     this.dynamicTagStore = config.dynamicTagStore || new DynamicTagStore({ filePath: dynamicFile });
     this.llmTagResolver = config.llmTagResolver || new LlmTagResolver({ timeoutMs: config.timeoutMs ?? 15000 });
+    this.tagOracle = new PixivTagOracle({
+      buildSearchAuth: () => this.buildSearchAuth(),
+      fetchJson: (url, headers) => this.fetchJsonQuick(url, headers),
+    });
     this.history = config.historyManager || defaultPixivHistory;
     this.limiter = config.rateLimiter || defaultPixivLimiter;
     this.timeoutMs = config.timeoutMs ?? 15000;
@@ -211,9 +244,19 @@ export class PixivService {
     try {
       if (!existsSync(this.mediaDir)) return;
       const files = readdirSync(this.mediaDir);
+      const present = new Set(files);
       for (const f of files) {
         if (f.endsWith('.tmp')) {
           try { unlinkSync(join(this.mediaDir, f)); } catch { /* ignore */ }
+          continue;
+        }
+        // 降噪成品 xxx.dn.jpg 的原图已不在（被淘汰/手工删除）时，成品一并清掉，避免孤儿文件堆积
+        if (f.endsWith('.dn.jpg')) {
+          const stem = f.slice(0, -'.dn.jpg'.length);
+          const hasOriginal = ['.jpg', '.jpeg', '.png', '.webp', '.bmp'].some(ext => present.has(stem + ext));
+          if (!hasOriginal) {
+            try { unlinkSync(join(this.mediaDir, f)); } catch { /* ignore */ }
+          }
         }
       }
     } catch {
@@ -292,6 +335,11 @@ export class PixivService {
           if (existsSync(meta.filePath)) {
             unlinkSync(meta.filePath);
             totalSize -= sizeMap.get(key) ?? 0;
+          }
+          // 发送前生成的降噪成品跟随原图一起淘汰
+          const derived = meta.filePath.replace(/\.[^./\\]+$/, '.dn.jpg');
+          if (derived !== meta.filePath && existsSync(derived)) {
+            try { totalSize -= statSync(derived).size; unlinkSync(derived); } catch { /* ignore */ }
           }
         } catch {
           // ignore
@@ -379,7 +427,7 @@ export class PixivService {
     }
 
     // 5. 去除常见前缀与后缀修饰
-    const prefixes = ['碧蓝航线', '碧蓝', '舰b', '原神', '星穹铁道', '星铁', '崩铁', '蔚蓝档案', 'ba', '明日方舟', '方舟'];
+    const prefixes = WORK_NAME_PREFIXES;
     const suffixes = ['图片一张', '图片两张', '图片三张', '图片', '美图', '壁纸', '插画', '一张', '两张', '三张', '图'];
     for (const p of prefixes) {
       if (clean.toLowerCase().startsWith(p.toLowerCase()) && clean.length > p.length) {
@@ -423,6 +471,9 @@ export class PixivService {
       .filter(Boolean);
 
     return rawTokens.map(token => {
+      // 人工维护的词典（角色别名、常见属性）优先于自学习动态表：动态表可能学到坏映射（如 女仆→ノエル(原神)）
+      const curated = CHARACTER_TAG_MAP[token] ?? COMMON_ATTR_MAP[token];
+      if (curated) return curated;
       const dyn = this.dynamicTagStore?.get(token);
       if (dyn && dyn.length > 0) return dyn.join(' ');
       return this.resolveSingleTag(token);
@@ -432,10 +483,59 @@ export class PixivService {
   /**
    * 异步智能解析标签列表：静态规则 + 动态自学习表 + LLM 语义回填持久化
    */
+  /** 最长匹配切分：仅在整词被词典完全覆盖时返回（允许跳过「的/和/与」） */
+  private segmentByDictionary(token: string): string[] | null {
+    const dict: Record<string, string[]> = {};
+    // 后写的覆盖先写的：动态表放最前，人工词典覆盖它
+    for (const [k, v] of Object.entries(this.dynamicTagStore.getAll())) if (k.length <= 8) dict[k] = v;
+    for (const [k, v] of Object.entries(FEATURE_DICT)) dict[k] = [v];
+    for (const [k, v] of Object.entries(COMMON_ATTR_MAP)) dict[k] = [v];
+    for (const [k, v] of Object.entries(CHARACTER_TAG_MAP)) dict[k] = [v];
+    const keys = Object.keys(dict).sort((a, b) => b.length - a.length);
+    const out: string[] = [];
+    let i = 0;
+    let pieces = 0;
+    while (i < token.length) {
+      const ch = token[i]!;
+      if ('的和与跟'.includes(ch)) { i++; continue; }
+      const k = keys.find(key => key.length >= 2 && token.startsWith(key, i));
+      if (!k) return null;
+      out.push(...dict[k]!);
+      i += k.length;
+      pieces++;
+    }
+    return pieces >= 2 ? Array.from(new Set(out)) : null;
+  }
+
+  /** 词是否已收录：静态别名/衣着/体型词，或动态自学习映射表 */
+  private isKnownToken(t: string): boolean {
+    return !!(CHARACTER_TAG_MAP[t] || COMMON_ATTR_MAP[t] || FEATURE_DICT[t] || this.dynamicTagStore?.get(t));
+  }
+
+  /**
+   * 复合词拆解：「属性词 + 已收录词」无空格粘连时（如 巨乳妃咲）拆成 [妃咲, 巨乳]。
+   * 剩余部分必须是已收录词才拆，否则整词保留：美少女战士、小林家的龙女仆、姐姐大人 拆开就是错的。
+   * 已能整词解析的词也原样保留。
+   *
+   * @param aggressive 为 true 时剩余部分未收录也拆。只在整词搜不到结果后的兜底重试里使用。
+   */
+  public expandCompoundTokens(tokens: string[], aggressive = false): string[] {
+    const out: string[] = [];
+    for (const tok of tokens) {
+      if (this.isKnownToken(tok)) { out.push(tok); continue; }
+      const peeled = aggressive ? peelFeatureWords(tok) : peelKnownCompound(tok, t => this.isKnownToken(t));
+      if (peeled) out.push(peeled.rest, ...peeled.features);
+      else out.push(tok);
+    }
+    return Array.from(new Set(out));
+  }
+
   public async resolveTagListAsync(input: string | string[]): Promise<string[]> {
-    const rawTokens = (Array.isArray(input) ? input : [input])
-      .flatMap(i => i.trim().split(/\s+/))
-      .filter(Boolean);
+    const rawTokens = this.expandCompoundTokens(
+      (Array.isArray(input) ? input : [input])
+        .flatMap(i => i.trim().split(/\s+/))
+        .filter(Boolean),
+    );
 
     if (rawTokens.length === 0) return [];
 
@@ -446,16 +546,50 @@ export class PixivService {
     for (let i = 0; i < rawTokens.length; i++) {
       const token = rawTokens[i]!;
 
-      // 1. 优先查动态自学习映射表
+      // 0. 人工维护的角色别名表优先于自动学习的动态表：动态表里可能留着旧的坏映射（如 帝国→帝国）
+      // 常见属性词（女仆、泳装…）同理：动态表里曾学到 女仆→ノエル(原神)
+      const curated = CHARACTER_TAG_MAP[token] ?? COMMON_ATTR_MAP[token];
+      if (curated) {
+        resolved.push(curated);
+        continue;
+      }
+
+      // 1. 优先查动态自学习映射表（中文短词须再过 Pixiv 校验，清掉历史坏映射如 祀→祭り）
       const dynamicMatch = this.dynamicTagStore?.get(token);
       if (dynamicMatch && dynamicMatch.length > 0) {
-        resolved.push(...dynamicMatch);
-        continue;
+        const needsCheck = /[一-龥]/.test(token) && this.oracleEnabled();
+        if (!needsCheck) {
+          resolved.push(...dynamicMatch);
+          continue;
+        }
+        const ctx = rawTokens.filter(t => t !== token);
+        const ok: string[] = [];
+        const failuresBefore = this.tagOracle.failures;
+        for (const m of dynamicMatch) {
+          if (await this.tagOracle.isValidMapping(token, m, ctx)) ok.push(m);
+        }
+        // 校验期间出现过网络失败：「不通过」不可信，保留已学到的映射，不改写也不删除
+        if (this.tagOracle.failures > failuresBefore) {
+          resolved.push(...dynamicMatch);
+          continue;
+        }
+        if (ok.length > 0) {
+          if (ok.join('\0') !== dynamicMatch.join('\0')) {
+            this.dynamicTagStore.set(token, ok);
+            this.dynamicTagStore.save();
+          }
+          resolved.push(...ok);
+          continue;
+        }
+        this.dynamicTagStore.delete(token);
+        this.dynamicTagStore.save();
+        // 坏映射已删，落入后续 Pixiv/LLM 路径
       }
 
       // 2. 查静态规则字典与消歧表
       const staticMatch = this.resolveSingleTag(token);
-      if (staticMatch !== token) {
+      // 静态规则只剥掉了作品名前缀、剩余部分仍是中文短语时（如 崩铁的坏女人卡芙卡 -> 的坏女人卡芙卡），交给 LLM 处理整词
+      if (staticMatch !== token && !(token.includes(staticMatch) && /[\u4e00-\u9fa5]/.test(staticMatch))) {
         resolved.push(staticMatch);
         continue;
       }
@@ -463,6 +597,9 @@ export class PixivService {
       // 3. 检查是否为包含中文自然语言描述的未收录词语/短语
       const hasChinese = /[\u4e00-\u9fa5]/.test(token);
       if (hasChinese) {
+        // 先用本地词典 + 动态表做最长匹配切分（如 贫乳大姐姐 -> 貧乳 お姉さん），全覆盖则不调 LLM
+        const seg = this.segmentByDictionary(token);
+        if (seg) { resolved.push(...seg); continue; }
         unmappedIndices.push(resolved.length);
         unmappedTokens.push(token);
         resolved.push(token); // 占位
@@ -474,45 +611,63 @@ export class PixivService {
 
     // 全部命中或无未映射中文短语，直接返回（0ms 快速路径，不消耗大模型）
     if (unmappedTokens.length === 0) {
-      return Array.from(new Set(resolved.filter(Boolean)));
+      return enforceBodyTags(rawTokens.join(' '), Array.from(new Set(resolved.filter(Boolean))));
     }
 
-    // 调用 LLM 进行语义理解与 Pixiv 规范标签对齐
+    // 未映射中文：优先 Pixiv 自动补全/共现推导；LLM 只作候选且必须通过 Pixiv 校验
     const fullInput = rawTokens.join(' ');
-    const llmResult = await this.llmTagResolver.resolve(unmappedTokens, fullInput);
+    const contextFor = (tok: string) => rawTokens.filter(t => t !== tok);
 
-    if (llmResult && llmResult.tags.length > 0) {
-      // 将大模型提炼的学习映射批量回填入动态自学习表，并持久化到本地磁盘
-      if (llmResult.mappings && Object.keys(llmResult.mappings).length > 0) {
-        this.dynamicTagStore.setBatch(llmResult.mappings);
+    for (let ui = 0; ui < unmappedTokens.length; ui++) {
+      const token = unmappedTokens[ui]!;
+      const idx = unmappedIndices[ui]!;
+      const derived = this.oracleEnabled() ? await this.tagOracle.deriveFromPixiv(token, contextFor(token)) : [];
+      if (derived.length > 0) {
+        resolved[idx] = derived[0]!;
+        // 多标签时追加到后面（少见）
+        for (const extra of derived.slice(1)) {
+          if (!resolved.includes(extra)) resolved.push(extra);
+        }
+        this.dynamicTagStore.set(token, derived);
+        unmappedTokens[ui] = '';
+        continue;
+      }
+    }
+
+    const stillUnmapped = unmappedTokens.map((t, i) => ({ t, i })).filter(x => x.t);
+    if (stillUnmapped.length === 0) {
+      this.dynamicTagStore.save();
+      return enforceBodyTags(rawTokens.join(' '), Array.from(new Set(resolved.filter(Boolean))));
+    }
+
+    const llmResult = await this.llmTagResolver.resolve(stillUnmapped.map(x => x.t), fullInput);
+
+    if (llmResult && (llmResult.tags.length > 0 || Object.keys(llmResult.mappings || {}).length > 0)) {
+      const filtered = this.oracleEnabled()
+        ? await this.tagOracle.filterMappings(llmResult.mappings || {}, rawTokens)
+        : (llmResult.mappings || {});
+      if (Object.keys(filtered).length > 0) {
+        this.dynamicTagStore.setBatch(filtered);
         this.dynamicTagStore.save();
       }
 
-      // 组装最终结果
-      const finalTags: string[] = [];
-      let unmappedCursor = 0;
-
-      for (let i = 0; i < resolved.length; i++) {
-        if (unmappedIndices.includes(i)) {
-          const originalToken = unmappedTokens[unmappedCursor++];
-          const mapped = (originalToken && llmResult.mappings[originalToken])
-            || (originalToken && this.dynamicTagStore.get(originalToken));
-
-          if (mapped && mapped.length > 0) {
-            finalTags.push(...mapped);
-          } else {
-            finalTags.push(...llmResult.tags);
+      for (const { t: originalToken, i: stillIdx } of stillUnmapped) {
+        const resolvedIdx = unmappedIndices[stillIdx]!;
+        const mapped = filtered[originalToken];
+        if (mapped && mapped.length > 0) {
+          resolved[resolvedIdx] = mapped[0]!;
+          for (const extra of mapped.slice(1)) {
+            if (!resolved.includes(extra)) resolved.push(extra);
           }
-        } else {
-          finalTags.push(resolved[i]!);
         }
+        // 校验失败：保留原词（resolved 里已是占位原词）
       }
 
-      return Array.from(new Set(finalTags.filter(Boolean)));
+      return enforceBodyTags(rawTokens.join(' '), Array.from(new Set(resolved.filter(Boolean))));
     }
 
     // LLM 不可用或解析失败时的优雅降级：保留原分词
-    return Array.from(new Set(resolved.filter(Boolean)));
+    return enforceBodyTags(rawTokens.join(' '), Array.from(new Set(resolved.filter(Boolean))));
   }
 
   /**
@@ -560,7 +715,149 @@ export class PixivService {
     count = 1,
   ): Promise<PixivSearchResult> {
     return this.chatMutex.runExclusive(chatKey, async () => {
-      return this.doSearchIllustrations(chatKey, keyword, count);
+      const tokens = this.expandCompoundTokens(
+        (Array.isArray(keyword) ? keyword : [keyword]).flatMap(k => k.trim().split(/\s+/)).filter(Boolean),
+      );
+      const dynBefore = this.dynamicTagStore.getAll();
+      const first = await this.doSearchIllustrations(chatKey, tokens, count);
+      if (first.illustrations.length > 0) console.log(`[PixivService] search "${tokens.join(' ')}" tags="${first.tag}" pids=${first.illustrations.map(x => x.pid).join(',')}`);
+      if (first.blocked || first.illustrations.length > 0) return first;
+      // 首次 0 结果：撤销本次请求新写入的（未经验证的）动态映射，避免缓存坏映射
+      const dropNew = () => {
+        const now = this.dynamicTagStore.getAll();
+        let changed = false;
+        for (const k of Object.keys(now)) {
+          if (!(k in dynBefore)) { this.dynamicTagStore.delete(k); changed = true; }
+          else if (JSON.stringify(now[k]) !== JSON.stringify(dynBefore[k])) { this.dynamicTagStore.set(k, dynBefore[k]!); changed = true; }
+        }
+        if (changed) this.dynamicTagStore.save();
+      };
+      dropNew();
+      // 整词搜不到：把「属性词+未收录词」粘连的词强行拆开再试一次（剩余部分走映射/推导/纠错）
+      const splitTokens = this.expandCompoundTokens(tokens, true);
+      if (splitTokens.join(' ') !== tokens.join(' ')) {
+        const viaSplit = await this.doSearchIllustrations(chatKey, splitTokens, count);
+        if (viaSplit.blocked) return viaSplit;
+        if (viaSplit.illustrations.length > 0) {
+          console.log(`[PixivService] split fallback "${tokens.join(' ')}" -> "${splitTokens.join(' ')}"`);
+          return { ...viaSplit, keyword: first.keyword, corrected: `拆分为「${splitTokens.join(' ')}」` };
+        }
+        dropNew();
+      }
+      if (process.env.PIXIV_LLM_TAGS !== '1' || process.env.PIXIV_LLM_CORRECT === '0') return first;
+      // 只有纯数量/纯 R-18 开关算控制词；含灰名单词的特征词（如 贫乳大姐姐）仍需纠错
+      const isControl = (t: string): boolean => /^\d+$/.test(t) || /^r-?18g?$/i.test(t);
+      const featureTokens = tokens.filter(t => !isControl(t));
+      if (featureTokens.length === 0) return first;
+      const t0 = Date.now();
+      // 标签过多导致 AND 搜不到时：保留前面的核心标签（角色通常在前），逐个去掉末尾的修饰标签再搜（最多 2 次）
+      // 搜不到时的放宽：①去掉角色标签的「(作品名)」后缀（LLM 常写错格式）；②逐个去掉末尾修饰标签。最多 3 次额外搜索
+      const relax = async (tagStr: string | undefined): Promise<PixivSearchResult | null> => {
+        const all = (tagStr || '').split(/\s+/).filter(Boolean);
+        const ctl = all.filter(isControl);
+        const feat = all.filter(t => !isControl(t));
+        const stripped = Array.from(new Set(feat.map(t => t.replace(/[(（][^()（）]*[)）]$/, '') || t)));
+        const protectedTags = stripped.filter(t => PROTECTED_TAG_RE.test(t));
+        const others = stripped.filter(t => !PROTECTED_TAG_RE.test(t));
+        let plans: string[][] = [];
+        if (stripped.join(' ') !== feat.join(' ')) plans.push(stripped);
+        // 只丢非受保护的修饰标签；用户明说的体型/外观特征绝不静默丢弃
+        for (let k = others.length - 1; k >= 0; k--) plans.push([...others.slice(0, k), ...protectedTags]);
+        plans = plans.filter(p => p.length > 0 && protectedTags.every(t => p.includes(t)));
+        // 始终保证尝试「只留第一个核心标签」（通常是角色名），避免 slice 上限漏掉
+        if (stripped.length > 0 && !plans.some(p => p.length === 1 && p[0] === stripped[0])) {
+          plans.push([stripped[0]!]);
+        }
+        for (const plan of plans.slice(0, 4)) {
+          const tryTags = [...plan, ...ctl];
+          const r = await this.doSearchIllustrations(chatKey, tryTags, count);
+          if (r.blocked) return r;
+          if (r.illustrations.length > 0) {
+            console.log(`[PixivService] relaxed "${all.join(' ')}" -> "${tryTags.join(' ')}"`);
+            return { ...r, keyword: first.keyword, corrected: `放宽为「${tryTags.join(' ')}」` };
+          }
+        }
+        return null;
+      };
+      // 优先用 Pixiv 推导纠正；LLM 仅提供候选且逐项校验
+      const pixivMapped: Record<string, string[]> = {};
+      for (const t of featureTokens) {
+        const derived = this.oracleEnabled() ? await this.tagOracle.deriveFromPixiv(t, featureTokens.filter(x => x !== t)) : [];
+        if (derived.length > 0 && derived.join(' ') !== t) pixivMapped[t] = derived;
+      }
+      const corr = await this.llmTagResolver.correct(featureTokens, tokens.join(' '));
+      const llmMapped = !corr ? {}
+        : this.oracleEnabled() ? await this.tagOracle.filterMappings(corr.mappings || {}, featureTokens)
+        : (corr.mappings || {});
+      // 合并：Pixiv 推导优先于 LLM
+      const merged: Record<string, string[]> = { ...llmMapped, ...pixivMapped };
+
+      const newTokens: string[] = [];
+      const applied: Record<string, string[]> = {};
+      for (const t of tokens) {
+        let m = !isControl(t) ? merged[t] : undefined;
+        if (!m && !isControl(t) && featureTokens.length === 1 && corr && corr.tags.length > 0) {
+          const filteredTags: string[] = [];
+          for (const cand of corr.tags) {
+            if (!this.oracleEnabled() || await this.tagOracle.isValidMapping(t, cand, featureTokens)) filteredTags.push(cand);
+          }
+          if (filteredTags.length) m = filteredTags;
+        }
+        if (m && m.length > 0) {
+          newTokens.push(...m);
+          if (m.join(' ') !== t) applied[t] = m;
+        } else {
+          newTokens.push(t);
+        }
+      }
+      const uniq = enforceBodyTags(tokens.join(' '), Array.from(new Set(newTokens)));
+      if (uniq.join(' ') === tokens.join(' ')) {
+        console.log(`[PixivService] correction: no change for "${tokens.join(' ')}" (${Date.now() - t0}ms)`);
+        return (await relax(first.tag)) ?? first;
+      }
+      console.log(`[PixivService] correction "${tokens.join(' ')}" -> "${uniq.join(' ')}" (${Date.now() - t0}ms)`);
+      const second = await this.doSearchIllustrations(chatKey, uniq, count);
+      if (second.blocked) return second;
+      if (second.illustrations.length > 0) {
+        if (Object.keys(applied).length > 0) {
+          this.dynamicTagStore.setBatch(applied);
+          this.dynamicTagStore.save();
+        }
+        const desc = Object.entries(applied).map(([k, v]) => `「${k}」→「${v.join(' ')}」`).join('，');
+        console.log(`[PixivService] mapping applied: ${desc}`);
+        return { ...second, keyword: first.keyword, corrected: desc || undefined };
+      }
+
+      // 纠正后仍 0：①原词再搜 ②纠正作品名 + 原始角色名
+      const originalRetry = await this.doSearchIllustrations(chatKey, tokens, count);
+      if (originalRetry.blocked) return originalRetry;
+      if (originalRetry.illustrations.length > 0) {
+        console.log(`[PixivService] fallback original tokens hit for "${tokens.join(' ')}"`);
+        dropNew();
+        return { ...originalRetry, keyword: first.keyword };
+      }
+
+      const hybrid2 = Array.from(new Set([
+        ...uniq.filter(t => !featureTokens.includes(t)),
+        ...featureTokens,
+        ...tokens.filter(isControl),
+      ]));
+      if (hybrid2.join(' ') !== uniq.join(' ') && hybrid2.join(' ') !== tokens.join(' ')) {
+        const third = await this.doSearchIllustrations(chatKey, hybrid2, count);
+        if (third.blocked) return third;
+        if (third.illustrations.length > 0) {
+          console.log(`[PixivService] fallback hybrid "${tokens.join(' ')}" -> "${hybrid2.join(' ')}"`);
+          dropNew();
+          return { ...third, keyword: first.keyword };
+        }
+      }
+
+      const relaxed = await relax(second.tag);
+      if (relaxed && !relaxed.blocked && relaxed.illustrations.length > 0) return relaxed;
+      const relaxedOrig = await relax(first.tag);
+      if (relaxedOrig && !relaxedOrig.blocked && relaxedOrig.illustrations.length > 0) return relaxedOrig;
+      dropNew();
+      return first;
     });
   }
 
@@ -591,7 +888,7 @@ export class PixivService {
     // 1. 提取本次请求被显式允许的灰名单类别（其余灰名单严格避免）
     const allowedGreylist = extractRequestedGreylist(tokens);
 
-    const targetCount = Math.max(1, Math.min(3, count)); // 单次上限收紧为 3 张
+    const targetCount = Math.max(1, Math.min(PIXIV_MAX_IMAGES, count)); // 单次上限 5 张（QQ 被动回复 5 条）
     const resolvedTags = await this.resolveTagListAsync(tokens);
 
     // 再次黑名单防线：若语义转换后的标签触发黑名单，坚决拦截
@@ -635,7 +932,9 @@ export class PixivService {
           illustType: meta.illustType ?? 0,
           xRestrict: Number(meta.xRestrict ?? 0),
           aiType: meta.aiType,
+          tierRank: INFLATED_BOOKMARKS.has(Number(meta.bookmarks)) ? QUALITY_WATERFALL_TIERS.length : tierOfBookmarks(Number(meta.bookmarks) || 0),
         };
+        if (INFLATED_BOOKMARKS.has(Number(meta.bookmarks))) illust.score = Math.min(illust.score, MIN_GOOD_SCORE - 1);
         allLocalForTag.push(illust);
         if (!sentPids.has(meta.pid)) {
           localMatches.push(illust);
@@ -643,11 +942,25 @@ export class PixivService {
       }
     }
 
+    // 同一作品的多页（p0/p1…）只保留得分最高的一页，避免一次回复里发出同一 PID 的多张
+    const dedupeByPid = (list: PixivIllustration[]): PixivIllustration[] => {
+      const best = new Map<string, PixivIllustration>();
+      for (const it of list) {
+        const cur = best.get(it.pid);
+        if (!cur || it.score > cur.score) best.set(it.pid, it);
+      }
+      return Array.from(best.values());
+    };
     localMatches.sort((a, b) => b.score - a.score);
+    const uniqueLocal = dedupeByPid(localMatches);
+    localMatches.length = 0;
+    localMatches.push(...uniqueLocal);
 
-    // 本地未看过充足，直接抽选返回
-    if (localMatches.length >= targetCount) {
-      const selected = this.sampleTopK(localMatches, targetCount);
+    // 本地未看过、且够好的候选充足，直接抽选返回；否则联网找更好的（老图、低收藏图不算数）
+    const goodLocal = localMatches.filter(m => m.score >= MIN_GOOD_SCORE);
+    const excellentLocal = localMatches.filter(m => m.score >= LOCAL_SHORTCUT_SCORE);
+    if (excellentLocal.length >= targetCount) {
+      const selected = this.sampleTopK(excellentLocal, targetCount);
       // 命中缓存时更新 cachedAt 访问时间戳，将 FIFO 进阶为真正的 LRU (NF-05)
       const nowMs = Date.now();
       for (const s of selected) {
@@ -675,7 +988,15 @@ export class PixivService {
 
     if (!isCircuitBroken) {
       try {
-        fetchedIllusts = await this.fetchFromNetwork(tag, allowedGreylist, resolvedTags, tokens);
+        fetchedIllusts = await this.fetchFromNetwork(
+          tag,
+          allowedGreylist,
+          resolvedTags,
+          tokens,
+          // 多备 2 个候选：有图下载失败时能补位，刚好够数的情况下也不至于少一张。只把够好的本地候选算进已有
+          Math.max(1, targetCount - goodLocal.length) + 2,
+          new Set([...sentPids, ...localMatches.map(m => m.pid)]),
+        );
         this.consecutiveFailures = 0; // 成功重置计数
       } catch {
         this.consecutiveFailures += 1;
@@ -696,23 +1017,26 @@ export class PixivService {
       }
     }
 
+    // 先用「够好」的（综合分 = 真实收藏数 × 1 年半衰期，达到 MIN_GOOD_SCORE），再按综合分；
+    // 不够好的只补缺口。档位（按真实收藏数）只在分数相同时决定先后
+    const good = (x: PixivIllustration): number => (x.score >= MIN_GOOD_SCORE ? 0 : 1);
+    const byTierThenScore = (a: PixivIllustration, b: PixivIllustration): number =>
+      good(a) - good(b) || b.score - a.score || (a.tierRank ?? 4) - (b.tierRank ?? 4);
     let candidateList = Array.from(candidatesMap.values());
-    candidateList.sort((a, b) => b.score - a.score);
+    candidateList.sort(byTierThenScore);
 
     // 4. 耗尽兜底（防循环刷屏：需校验 120 秒冷却）
     if (candidateList.length === 0) {
       if (this.history.canReset(chatKey)) {
-        this.history.clearChat(chatKey);
+        // 只让「本次检索范围内」的作品重新可发；不清掉这个会话其它标签的已发记录
+        const pool = dedupeByPid([...allLocalForTag, ...fetchedIllusts]);
+        this.history.forget(chatKey, pool.map(p => p.pid));
         exhaustedReset = true;
-
-        for (const item of allLocalForTag) {
-          candidatesMap.set(item.pid, item);
-        }
-        for (const item of fetchedIllusts) {
+        for (const item of pool) {
           candidatesMap.set(item.pid, item);
         }
         candidateList = Array.from(candidatesMap.values());
-        candidateList.sort((a, b) => b.score - a.score);
+        candidateList.sort(byTierThenScore);
       }
     }
 
@@ -726,13 +1050,23 @@ export class PixivService {
       };
     }
 
-    // 5. 采样指定数量
-    const chosen = this.sampleTopK(candidateList, targetCount);
+    // 5. 采样指定数量：在够好的候选里按 Top-K 随机抽取，其余候选排在后面作为补位
+    const goodCandidates = candidateList.filter(c => c.score >= MIN_GOOD_SCORE);
+    const chosen = this.sampleTopK(goodCandidates.length >= targetCount ? goodCandidates : candidateList, targetCount);
+    const chosenSet = new Set(chosen);
+    const queue = [...chosen, ...candidateList.filter(c => !chosenSet.has(c))];
 
-    // 6. 缓存入库门禁：确保选中的图片原图已下载，并通过完整性校验与质检网落盘
+    // 6. 缓存入库门禁：确保选中的图片原图已下载，并通过完整性校验与质检网落盘。
+    // 某张下载/校验失败时用后备候选补位，保证尽量凑够用户要求的数量。
     const finalized: PixivIllustration[] = [];
     let updatedLocalCache = false;
-    for (const item of chosen) {
+    // 补位次数设上限：下载全部失败时（pximg 断网/403）不能把整个候选池逐个试一遍
+    const maxAttempts = targetCount + 3;
+    let attempts = 0;
+    let consecutiveDownloadFailures = 0;
+    for (const item of queue) {
+      if (finalized.length >= targetCount) break;
+      if (attempts >= maxAttempts || consecutiveDownloadFailures >= 3) break;
       if (item.localPath && existsSync(item.localPath)) {
         finalized.push(item);
         // 本地缓存命中时同步刷新 cachedAt 时间戳 (NF-05)
@@ -750,11 +1084,13 @@ export class PixivService {
             continue;
           }
 
+          attempts++;
           const downloadedPath = await this.downloadOriginalImage(
             item.pid,
             item.originalUrl,
             item.page ?? 0,
           );
+          consecutiveDownloadFailures = 0;
           item.localPath = downloadedPath;
           const cacheKey = `${item.pid}_p${item.page ?? 0}`;
           this.metadataMap.set(cacheKey, {
@@ -776,6 +1112,7 @@ export class PixivService {
           finalized.push(item);
         } catch {
           // 下载或校验失败跳过该候选
+          consecutiveDownloadFailures++;
         }
       }
     }
@@ -944,6 +1281,40 @@ export class PixivService {
     }
   }
 
+  /**
+   * 标签推导/校验用的轻量请求：单次、短超时、遵守熔断，失败计入连续失败数。
+   * 搜图本身可以慢慢重试，但标签校验是搜图前的附加步骤，网络不通时不能把一条消息拖成分钟级。
+   */
+  private async fetchJsonQuick(url: string, headers: Record<string, string>): Promise<unknown> {
+    if (Date.now() < this.circuitBreakUntil) throw new Error('Pixiv 熔断中，跳过标签校验请求');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(this.timeoutMs, 6000));
+    try {
+      const resp = await fetch(url, { headers, signal: controller.signal });
+      if (!resp.ok) throw new Error(`Pixiv HTTP ${resp.status}`);
+      const json = await resp.json();
+      this.consecutiveFailures = 0;
+      return json;
+    } catch (err) {
+      this.consecutiveFailures += 1;
+      if (this.consecutiveFailures >= 5) this.circuitBreakUntil = Date.now() + 5 * 60 * 1000;
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 是否用 Pixiv 自动补全/搜索共现来推导与校验标签。
+   * PIXIV_TAG_ORACLE=1/0 显式开关；未设置时跟随 PIXIV_LLM_TAGS（不开 LLM 纠错就不额外联网）。
+   */
+  private oracleEnabled(): boolean {
+    const v = process.env.PIXIV_TAG_ORACLE;
+    if (v === '1') return true;
+    if (v === '0') return false;
+    return process.env.PIXIV_LLM_TAGS === '1';
+  }
+
   /** 429 / 5xx 指数退避，最多 3 次。401/403 不重试，直接说明要凭据。 */
   private async fetchJson(url: string, headers: Record<string, string>): Promise<unknown> {
     let lastError: Error | null = null;
@@ -989,12 +1360,15 @@ export class PixivService {
     auth: SearchAuth,
     resolvedTags: string[],
     rawTokens: string[],
-  ): Promise<PixivIllustration[]> {
+    page = 1,
+    fetchTierRank = QUALITY_WATERFALL_TIERS.length,
+  ): Promise<PixivIllustration[] & { rawCount?: number }> {
     const wantsR18 = allowedGreylist.has('r18');
     const searchUrl = buildIllustrationSearchUrl(queryTag, {
       wantsR18,
       appApi: auth.appApi,
       proxyBaseUrl: auth.proxyBaseUrl,
+      page,
     });
     const json = await this.fetchJson(searchUrl, auth.headers);
     const rows = extractSearchWorks(json);
@@ -1006,7 +1380,8 @@ export class PixivService {
       const mapped = mapSearchWork(row, assumeMissingIsR18);
       if (!mapped) continue;
 
-      const effectiveBookmarks = Math.max(mapped.bookmarks, minScoreBias);
+      // 收藏数已知就用真实值；只有接口没给（网页搜索）时才用所在档位的门槛估计
+      const effectiveBookmarks = mapped.bookmarksKnown ? mapped.bookmarks : Math.max(mapped.bookmarks, minScoreBias);
       const meta: CachedPixivMetadata = {
         pid: mapped.pid,
         title: mapped.title,
@@ -1045,41 +1420,79 @@ export class PixivService {
         illustType: mapped.illustType,
         xRestrict: mapped.xRestrict,
         aiType: mapped.aiType,
+        tierRank: mapped.bookmarksKnown ? tierOfBookmarks(mapped.bookmarks) : fetchTierRank,
       });
     }
-    return results;
+    return Object.assign(results, { rawCount: rows.length });
   }
 
   /**
    * 质量阶梯漏斗：10000 → 5000 → 1000 → 500 users入り，最后才用纯标签。
    * resolvedTags / rawTokens 传给每一档，避免网络结果绕过 AND。
+   * 上一档候选不够（want 张都凑不满）时继续往下一档补，而不是只拿第一档就停，
+   * 否则用户要 5 张、最高档只有 2 张时会只返回 2 张。
    */
   private async fetchFromNetwork(
     tag: string,
     allowedGreylist: Set<string>,
     resolvedTags: string[] = [],
     rawTokens: string[] = [],
+    want = 1,
+    exclude: Set<string> = new Set(),
   ): Promise<PixivIllustration[]> {
     const auth = await this.buildSearchAuth();
-    for (const tier of QUALITY_WATERFALL_TIERS) {
-      const tierTag = `${tag} ${tier.suffix}`;
-      try {
-        const candidates = await this.fetchFromNetworkSingleQuery(
-          tierTag,
-          tag,
-          tier.minScoreBias,
-          allowedGreylist,
-          auth,
-          resolvedTags,
-          rawTokens,
-        );
-        if (candidates.length > 0) return candidates;
-      } catch {
-        // 单个阶梯失败就降到下一档
+    const target = Math.max(1, want);
+    const pool = new Map<string, PixivIllustration>();
+    const absorb = (items: PixivIllustration[], tierRank: number): void => {
+      for (const it of items) if (!pool.has(it.pid)) pool.set(it.pid, { ...it, tierRank: it.tierRank ?? tierRank });
+    };
+    // 够好的新候选（没发过、综合分达标）。只数够好的：老图、刷标签的低收藏图不算数，不够就继续翻页/降档
+    const goodFresh = (): number => {
+      let n = 0;
+      for (const [pid, it] of pool) if (!exclude.has(pid) && it.score >= MIN_GOOD_SCORE) n++;
+      return n;
+    };
+
+    // 查询顺序：每一轮把各档的下一页各查一次（10000 p1 → 5000 p1 → 1000 p1 → 500 p1 → 10000 p2 → …）。
+    // 至少看完前两档的第 1 页才允许提前结束，这样选图时新一点的 5000 档作品能和老的 10000 档作品比综合分。
+    const exhausted = new Set<number>();
+    let steps = 0;
+    outer: for (let page = 1; page <= TIER_PAGES; page++) {
+      for (const [tierIdx, tier] of QUALITY_WATERFALL_TIERS.entries()) {
+        if (exhausted.has(tierIdx)) continue;
+        let rawCount = 0;
+        try {
+          const items = await this.fetchFromNetworkSingleQuery(
+            `${tag} ${tier.suffix}`,
+            tag,
+            tier.minScoreBias,
+            allowedGreylist,
+            auth,
+            resolvedTags,
+            rawTokens,
+            page,
+            tierIdx,
+          );
+          rawCount = items.rawCount ?? items.length;
+          absorb(items, tierIdx);
+        } catch {
+          exhausted.add(tierIdx); // 这一档出错就不再查
+          continue;
+        }
+        steps++;
+        if (rawCount < 30) exhausted.add(tierIdx); // 这一档没有更多了
+        if (steps >= 2 && goodFresh() >= target) break outer;
+        await new Promise(r => setTimeout(r, 300));
       }
-      await new Promise(r => setTimeout(r, 300));
     }
-    return this.fetchFromNetworkSingleQuery(tag, tag, 0, allowedGreylist, auth, resolvedTags, rawTokens);
+    if (goodFresh() >= target) return Array.from(pool.values());
+    try {
+      absorb(await this.fetchFromNetworkSingleQuery(tag, tag, 0, allowedGreylist, auth, resolvedTags, rawTokens, 1, QUALITY_WATERFALL_TIERS.length), QUALITY_WATERFALL_TIERS.length);
+    } catch (err) {
+      // 各档都已有结果时忽略最后一档的失败；一无所获才把错误抛给上层计入熔断
+      if (pool.size === 0) throw err;
+    }
+    return Array.from(pool.values());
   }
 
   /**
@@ -1177,5 +1590,77 @@ export class PixivService {
   }
 }
 
+
+const FLAT_RE = /贫乳|貧乳|平胸|贫胸|微乳|小胸|飞机场/;
+const BIG_RE = /巨乳|爆乳|大胸|大奶/;
+/** 用户明说的体型优先：贫乳请求里去掉巨乳类标签，反之亦然，并确保核心体型标签在场 */
+export function enforceBodyTags(rawText: string, tags: string[]): string[] {
+  let out = [...tags];
+  if (FLAT_RE.test(rawText) && !BIG_RE.test(rawText)) {
+    out = out.filter(t => !/巨乳|爆乳|おっぱい|微乳/.test(t));
+    if (!out.includes('貧乳')) out.unshift('貧乳');
+  } else if (BIG_RE.test(rawText) && !FLAT_RE.test(rawText)) {
+    out = out.filter(t => !/貧乳|微乳|ちっぱい/.test(t));
+    if (!out.some(t => /巨乳|爆乳/.test(t))) out.unshift('巨乳');
+  }
+  return Array.from(new Set(out));
+}
+/** 受保护标签：放宽搜索时不得静默丢弃 */
+export const PROTECTED_TAG_RE = /乳|胸|お姉さん|ロリ|髪|耳|タイツ|ストッキング|メイド|水着|制服|眼鏡|ツインテール|ポニーテール|美少女|男の娘|巫女/;
+
 /** 全局单例服务 */
+
+/** QQ 被动回复：同一条用户消息最多回 5 条，所以 /pixiv 单次最多 5 张（每张图 = 1 条消息，画师写在图片说明里） */
+export const PIXIV_MAX_IMAGES = 5;
+const CN_DIGIT: Record<string, number> = { 零: 0, 一: 1, 二: 2, 两: 2, 俩: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+function cnToNumber(s: string): number {
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  if (s === '十') return 10;
+  const m = s.match(/^([一二两三四五六七八九])?十([一二三四五六七八九])?$/);
+  if (m) return (m[1] ? CN_DIGIT[m[1]]! : 1) * 10 + (m[2] ? CN_DIGIT[m[2]]! : 0);
+  if (s.length === 1 && s in CN_DIGIT) return CN_DIGIT[s]!;
+  return NaN;
+}
+const NUM = '(\\d{1,4}|零|[一二两俩三四五六七八九]?十[一二三四五六七八九]?|[一二两俩三四五六七八九])';
+const COUNT_RE = new RegExp(`(^|[^第\\dA-Za-z])${NUM}\\s*(张|幅|份|[pP](?![A-Za-z]))`);
+const FILLER_TOKENS = new Set(['来', '来点', '来一点', '要', '给', '给我', '帮我', '请', '麻烦', '再', '再来', '就行', '就好', '即可', '谢谢', '一下', '的', '图', '图片', '插画', '美图', '吧', '呗', '啊', '呀', '哦', '嘛', '去', '爬', '去爬', '整', '搞', '发', '有没有', '那种']);
+const PREFIX_RE = /^(请|麻烦)?(帮我|给我|帮忙|我要|我想要|我想看|想要|想看|去爬|去找|去搜|爬|找找|找点|找|搜索|搜一下|搜下|一下|发点|发|整点|整张|整个|整|给爷|有没有|我要看|来张|来个|搜|看看|再来|再给)+/;
+const LAI_RE = /^来(点|一点|个|几张)/;
+const SUFFIX_RE = /(的)?(图片|插画|美图|萌图|帅图|图)?(就行|就好|即可|谢谢|吧|呗|啊|呀|哦|嘛|那种|有没有)+$|(的)?(图片|插画|美图|萌图|帅图|图)(来)?$|的?那种$/;
+
+/**
+ * 解析自然语言 /pixiv 请求：返回关键词与数量（显式 N 张/幅/p/份；或末尾单独的 1~9 数字）。
+ * 名字/标签内的数字（2B、22/7、86、5等分、初音未来 39）不会被当成数量。
+ */
+export function parseNaturalPixivQuery(input: string): { keyword: string; count?: number } {
+  let count: number | undefined;
+  let text = ` ${input.trim().replace(/[，,、。！!？?；;～~]+/g, ' ')} `;
+  const m = text.match(COUNT_RE);
+  if (m) {
+    const v = cnToNumber(m[2]!);
+    if (!Number.isNaN(v) && v > 0) count = Math.min(PIXIV_MAX_IMAGES, v);
+    text = text.slice(0, m.index! + m[1]!.length) + ' ' + text.slice(m.index! + m[0].length);
+  }
+  const out: string[] = [];
+  for (let tok of text.split(/\s+/).filter(Boolean)) {
+    let prev = '';
+    while (prev !== tok) {
+      prev = tok;
+      if (FILLER_TOKENS.has(tok)) { tok = ''; break; }
+      tok = tok.replace(PREFIX_RE, '').replace(LAI_RE, '').replace(SUFFIX_RE, '');
+    }
+    // 粘连在词尾的常用独立标签拆开：初音未来壁纸 -> 初音未来 壁纸；2B的R-18 -> 2B R-18
+    const tail: string[] = [];
+    let mm: RegExpMatchArray | null;
+    while (tok && (mm = tok.match(/^(.+?)的?(壁纸|R-18G?|r18g?|R18G?)$/))) { tail.unshift(mm[2]!); tok = mm[1]!; }
+    if (tok) out.push(tok);
+    out.push(...tail);
+  }
+  // 末尾单独数字 1~9 视为数量（如 "/pixiv 信浓 3"），更大的数字保留为标签
+  if (count === undefined && out.length > 1 && /^[1-9]$/.test(out[out.length - 1]!)) {
+    count = Math.min(PIXIV_MAX_IMAGES, parseInt(out.pop()!, 10));
+  }
+  return { keyword: out.join(' '), count };
+}
+
 export const defaultPixivService = new PixivService();

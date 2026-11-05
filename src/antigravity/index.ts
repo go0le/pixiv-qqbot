@@ -5,3 +5,4 @@ export * from './session-manager.ts';
 export * from './auth.ts';
 export * from './media.ts';
 export * from './bot.ts';
+export * from './napcat-adapter.ts';

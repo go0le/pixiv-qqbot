@@ -9,6 +9,8 @@ export interface MappedSearchWork {
   artist: string;
   tags: string[];
   bookmarks: number;
+  /** 接口是否真的给了收藏数（app-api 有 total_bookmarks；网页搜索结果没有） */
+  bookmarksKnown: boolean;
   uploadDate: string;
   originalUrl?: string;
   illustType: number;
@@ -116,7 +118,8 @@ export function mapSearchWork(
   const illustType = readIllustType(item);
   if (illustType === 2) return null;
   const uploadRaw = item.createDate ?? item.create_date ?? item.updateDate ?? item.update_date;
-  const bookmarksRaw = Number(item.bookmarkCount ?? item.total_bookmarks ?? item.likeCount ?? 0);
+  const bookmarksField = item.bookmarkCount ?? item.total_bookmarks;
+  const bookmarksRaw = Number(bookmarksField ?? item.likeCount ?? 0);
   const titleRaw = item.title ?? item.illustTitle;
   return {
     pid: String(id),
@@ -124,6 +127,7 @@ export function mapSearchWork(
     artist: readArtist(item),
     tags: coerceTags(item.tags),
     bookmarks: Number.isFinite(bookmarksRaw) ? bookmarksRaw : 0,
+    bookmarksKnown: bookmarksField !== undefined && bookmarksField !== null && Number.isFinite(Number(bookmarksField)),
     uploadDate: typeof uploadRaw === 'string' && uploadRaw ? uploadRaw : new Date().toISOString(),
     originalUrl: pickOriginalUrl(item),
     illustType,
@@ -134,16 +138,21 @@ export function mapSearchWork(
 
 export function buildIllustrationSearchUrl(
   queryTag: string,
-  opts: { wantsR18: boolean; appApi: boolean; proxyBaseUrl?: string },
+  opts: { wantsR18: boolean; appApi: boolean; proxyBaseUrl?: string; page?: number },
 ): string {
+  const page = Math.max(1, Math.floor(opts.page ?? 1));
   if (opts.appApi) {
     const params = new URLSearchParams({
       word: queryTag,
       search_target: queryTag.includes(' ') ? 'partial_match_for_tags' : 'exact_match_for_tags',
       sort: 'date_desc',
     });
+    // app-api 每页 30 条，第 N 页用 offset 翻
+    if (page > 1) params.set('offset', String((page - 1) * 30));
     // for_ios 会把 R-18 从 app-api 结果里拿掉。明文要 R-18 时不能带这个滤镜。
-    if (!opts.wantsR18) params.set('filter', 'for_ios');
+    // for_ios 会同时滤掉 Pixiv 标记为“敏感”的全年龄图，结果过于“健全”。默认不再加；
+    // 官方 R-18 仍由 checkImageGreylist(xRestrict>0) 在本地拦截。PIXIV_SAFE_FILTER=1 恢复旧行为。
+    if (!opts.wantsR18 && process.env.PIXIV_SAFE_FILTER === '1') params.set('filter', 'for_ios');
     return `https://app-api.pixiv.net/v1/search/illust?${params.toString()}`;
   }
 
@@ -152,5 +161,5 @@ export function buildIllustrationSearchUrl(
   const mode = opts.wantsR18 ? 'r18' : 'safe';
   const origin = (opts.proxyBaseUrl || 'https://www.pixiv.net').replace(/\/$/, '');
   const q = encodeURIComponent(queryTag);
-  return `${origin}/ajax/search/illustrations/${q}?word=${q}&order=date_d&mode=${mode}&p=1&s_mode=${sMode}&type=illust`;
+  return `${origin}/ajax/search/illustrations/${q}?word=${q}&order=date_d&mode=${mode}&p=${page}&s_mode=${sMode}&type=illust`;
 }

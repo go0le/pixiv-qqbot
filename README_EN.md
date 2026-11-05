@@ -243,14 +243,6 @@ export QQBOT_APPID="xxx" QQBOT_SECRET="xxx"
 npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 ```
 
-## Pixiv illustrations
-
-`/pixiv <tag> [tag...] [count]` and the `qqbot_pixiv_search` tool download illustrations and send them as QQ images. Multiple ordinary tags are AND. Greylist terms (R-18, oral, and the other classes in `src/pixiv/constants.ts`) are excluded unless the user names that class in plain text; R-18 then requires Pixiv's official `xRestrict`. See [docs/pixiv-feature-spec.md](docs/pixiv-feature-spec.md).
-
-Set `PIXIV_REFRESH_TOKEN` and/or `PIXIV_PHPSESSID` (or `PIXIV_COOKIE`). Optional `PIXIV_PROXY_BASE_URL` is a reverse proxy of `www.pixiv.net`. Do not commit secrets. `PIXIV_LLM_TAGS=1` opts into external tag translation; it is off by default.
-
-Automated tests mock Pixiv HTTP. A live Pixiv login and a real QQ upload are still unchecked, including Cloudflare blocks, content-audit rejects, and whether a rejected send should be retried with another image.
-
 ## License
 
 [MIT](./LICENSE)

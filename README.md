@@ -1,6 +1,3 @@
-
-> **说明：** 本仓库是基于 [@tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot) 的修复版，发布在 `go0le/pixiv-qqbot`。主要改动：Pixiv 黑名单短词改为整词匹配，避免 `bl` 误伤 `blonde` 等标签；规则与测试见 `src/pixiv/`。
-
 <div align="center">
 
 <img width="120" src="https://img.shields.io/badge/🤖-QQ_Bot-blue?style=for-the-badge" alt="QQ Bot" />
@@ -26,6 +23,27 @@
 </table>
 
 </div>
+
+## NapCat 版机器人「哈Gemi」（2026-11）
+
+在上面的官方 QQ Bot 插件之外，本仓库还包含一个基于 [NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot 11）的 QQ 机器人「哈Gemi」：用 Google Antigravity（`agy`）做对话 Agent，入口是 `src/bin/napcat-qqbot.ts`，核心在 `src/antigravity/napcat-adapter.ts`。
+
+- **人设**：Gemini 娘·四角星猫耳，角色卡、运行约束和表情贴图都在 [`persona/`](persona/)，管理员环境的常驻指令是根目录的 `AGENTS.md`。
+- **权限分档**：管理员（`NAPCAT_ADMIN_IDS`）可以安排服务器上的工作；其他人只能聊天和找图，跑在 bubblewrap 沙箱里的受限 `agy` 中，没有执行命令、写文件、取网页的权限。受限环境由 `scripts/setup-guest-home.py` 生成。
+- **找图**：明文要图走快速通道（`src/pixiv/`）；Agent 里用 [pixiv-mcp](https://github.com/go0le/pixiv-mcp)。两边共用同一份「已发 PID」记录（`PIXIV_HISTORY_FILE`），同一个会话不重复出图。灰名单（R-18 等）按会话白/黑名单控制。
+- **记忆**：[MemoryOS 的 hagemi 分支](https://github.com/go0le/MemoryOS/tree/hagemi)，基于 [BAI-LAB/MemoryOS](https://github.com/BAI-LAB/MemoryOS)。机器人按 QQ 号存取记忆，群聊和私聊分开存，模型碰不到别人的记忆。召回逻辑在 `src/antigravity/memory-client.ts`。
+- **群聊**：在开通了主动模式的群里（`@她 /proactive on`）会接话、冷场时冒泡，叫名字不用 @。引用她发过的图时，她知道那张图是什么。
+- **表情贴图**：回复里的 `[表情:名]` 会换成 `persona/expressions/` 里的贴图，默认 30% 的概率附图（`NAPCAT_EXPRESSION_CHANCE`）。
+- **稳定性**：会挂起整轮的工具（如 `schedule`）会被打断并改用系统定时任务；回复写完但这一轮迟迟不结束时，先把回复发出去；超时后排队的消息不会丢；发送回执超时会先确认消息有没有发出去，再决定是否重发。
+
+运行（需要 Node ≥ 20、已登录的 `agy`、NapCat 开启正向 WebSocket）：
+
+```bash
+npm ci && npx tsc -p tsconfig.json
+cp .env.example .env.qqbot        # 至少填 NAPCAT_ADMIN_IDS、PIXIV_REFRESH_TOKEN
+python3 scripts/setup-guest-home.py   # 生成受限环境（需要 bubblewrap）
+node --experimental-websocket dist/bin/napcat-qqbot.js
+```
 
 ## 架构
 
@@ -163,45 +181,6 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `/bot-version` | 查看版本信息 |
 | `/bot-status` | 查看当前会话状态 |
 | `/bot-help` | 查看所有指令 |
-| `/pixiv <标签…> [数量]` | 检索 Pixiv 插画并作为图片消息发送。多个标签须同时命中，数量 1～3 |
-
-## Pixiv 插画
-
-行为说明见 [docs/pixiv-feature-spec.md](docs/pixiv-feature-spec.md)。这里只写怎么配、怎么跑，以及还没在真环境验证的部分。
-
-### 环境变量
-
-不要把凭据写进仓库。
-
-| 变量 | 作用 |
-|---|---|
-| `PIXIV_REFRESH_TOKEN` | Pixiv OAuth refresh token。配置后走 `app-api.pixiv.net` 搜索 |
-| `PIXIV_PHPSESSID` | 网页登录 Cookie。没配 refresh token 时，网页 AJAX 会带上它 |
-| `PIXIV_COOKIE` | 完整 Cookie 请求头。设了它就不再单独拼 PHPSESSID |
-| `PIXIV_PROXY_BASE_URL` | `www.pixiv.net` 的反代源站（路径与网页 AJAX 相同）。设了之后不再改打 app-api |
-| `PIXIV_LLM_TAGS` | 设为 `1` 才允许用本机 `agy` 把未收录中文补成标签。默认关闭，未收录词原样搜索 |
-| `QQBOT_APPID` / `QQBOT_SECRET` | QQ 机器人凭据，见上文 |
-
-R-18 和多数登录后才能看的搜索，不配 `PIXIV_REFRESH_TOKEN` 或 `PIXIV_PHPSESSID` 时，Pixiv 会空结果或 403。Node 自带的 `fetch` 不读 `HTTP_PROXY`。
-
-缓存和去重写在 `~/.dsh-qqbot/`（`media/`、`pixiv_metadata.json`、`pixiv_history.json`）。
-
-### 入口
-
-- 斜杠命令：`/pixiv 信浓`、`/pixiv 信浓 泳装 2`
-- Agent 工具：`qqbot_pixiv_search`（`keyword`、`count` 1～3、`auto_send`）
-
-同一会话 15 秒冷却。图片经 `bot.sendImage` 发送（SDK 内部上传再发），每张图再跟一行画师名。
-
-### 还需要真环境核对的事
-
-单元测试用 mock HTTP，没有连上过 Pixiv，也没有发过 QQ。
-
-- 云服务器出口访问 `oauth.secure.pixiv.net`、`app-api.pixiv.net`、`www.pixiv.net`、`i.pximg.net` 是否被 Cloudflare 或 403 拦住
-- refresh token 是否过期、网页 Cookie 是否够用
-- QQ 侧上传后审核是否拒图；拒图后的 PID 目前仍会记进已发列表，下一轮不会自动换一张
-- 被动回复窗口：搜索较慢时，没有单独再占一次 msg_id
-- 旧草稿里的 `/pixiv purge`、`--ai`、全局每分钟上限没有做
 
 ## 核心模块
 
@@ -247,13 +226,7 @@ src/
 ├── media/                      # 多媒体
 │   ├── vision-tool.ts          # 图片视觉理解
 │   ├── send-file-tool.ts       # 发送本地文件
-│   ├── pixiv-tool.ts           # qqbot_pixiv_search
 │   └── media-cleaner.ts        # 媒体 TTL 清理
-├── pixiv/                      # Pixiv 检索、过滤、缓存、登录态
-│   ├── service.ts
-│   ├── filter.ts
-│   ├── parse.ts
-│   └── auth.ts
 ├── middleware/                 # 中间件
 │   ├── question-answer.ts      # 问答答案处理
 │   └── attachment.ts           # 附件处理

@@ -9,7 +9,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import type { ImQQBotConfig } from '../config.ts';
 import type { DshAgent, SessionManager } from '../session/index.ts';
 import type { Logger, ReplyTarget } from '../types.ts';
-import { checkRequestBlacklist, defaultPixivService } from '../pixiv/index.ts';
+import { checkRequestBlacklist, defaultPixivService, parseNaturalPixivQuery, PIXIV_MAX_IMAGES } from '../pixiv/index.ts';
 import type { MediaSenderLike } from './send-media.ts';
 
 export const PIXIV_TOOL_NAME = 'qqbot_pixiv_search';
@@ -51,7 +51,7 @@ export function registerPixivTool(
         },
         count: {
           type: 'integer',
-          description: 'Number of images to fetch (1 to 3, default 1).',
+          description: `Number of images to fetch (1 to ${PIXIV_MAX_IMAGES}, default 1).`,
         },
         auto_send: {
           type: 'boolean',
@@ -81,6 +81,8 @@ export function registerPixivTool(
           },
           cooldownSec: { type: 'integer' },
           exhaustedReset: { type: 'boolean' },
+          imagesSent: { type: 'integer' },
+          note: { type: 'string' },
         },
         required: ['tag', 'foundCount', 'images'],
         additionalProperties: false,
@@ -94,7 +96,10 @@ export function registerPixivTool(
       args: unknown,
       exec: { signal: AbortSignal; agent?: unknown },
     ): Promise<Record<string, unknown>> {
-      const { keyword, count = 1, auto_send = true } = args as PixivToolArgs;
+      const { keyword: rawKeyword, count: rawCount, auto_send = true } = args as PixivToolArgs;
+      const nq = parseNaturalPixivQuery(String(rawKeyword || ''));
+      const keyword = nq.keyword || rawKeyword;
+      const count = rawCount ?? nq.count ?? 1;
       if (!keyword || typeof keyword !== 'string') {
         throw new Error('qqbot_pixiv_search: `keyword` must be a non-empty string');
       }
@@ -136,7 +141,7 @@ export function registerPixivTool(
         };
       }
 
-      const searchCount = Math.max(1, Math.min(3, Number(count) || 1));
+      const searchCount = Math.max(1, Math.min(PIXIV_MAX_IMAGES, Math.floor(Number(count)) || 1));
       const res = await defaultPixivService.searchIllustrations(chatKey, keyword, searchCount);
 
       if (res.blocked) {
@@ -158,19 +163,16 @@ export function registerPixivTool(
         };
       }
 
+      let sentIdx = 0;
       if (auto_send && replyTarget && res.illustrations.length > 0) {
-        let sentIdx = 0;
         for (const illust of res.illustrations) {
           if (illust.localPath) {
             try {
               if (sentIdx > 0) {
                 await new Promise(r => setTimeout(r, 1500));
               }
-              await bot.sendImage(replyTarget, { localPath: illust.localPath });
-              const textSender = bot as unknown as { sendText?: (target: ReplyTarget, text: string) => Promise<unknown> };
-              if (typeof textSender.sendText === 'function') {
-                await textSender.sendText(replyTarget, `🎨 画师：${illust.artist}`);
-              }
+              await (bot as unknown as { sendImage: (t: ReplyTarget, src: { localPath: string }, o?: { content?: string }) => Promise<unknown> })
+                .sendImage(replyTarget, { localPath: illust.localPath }, { content: `🎨 画师：${illust.artist}` });
               sentIdx++;
             } catch (err) {
               logger.warn(`im-qqbot: failed to auto-send pixiv image: ${err instanceof Error ? err.message : String(err)}`);
@@ -189,6 +191,8 @@ export function registerPixivTool(
           localPath: i.localPath,
         })),
         exhaustedReset: res.exhaustedReset ?? false,
+        imagesSent: sentIdx,
+        note: `已发送 ${sentIdx} 张图片（每张图片为 1 条消息，画师在图片说明里）。不要再发送图片数量总结或额外的确认消息。`,
       };
     },
   };

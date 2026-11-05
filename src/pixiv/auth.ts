@@ -6,7 +6,7 @@
 
 const OAUTH_URL = 'https://oauth.secure.pixiv.net/auth/token';
 const CLIENT_ID = 'MOBrBDS8blbauoSck0ZfDbtuzpyT';
-const CLIENT_SECRET = 'lsACyP96orsfJ6itlE2b7e7h5jB2s3v6';
+const CLIENT_SECRET = 'lsACyCD94FhDUtGTXi3QzcFE2uU1hqtDaKeqrdwj';
 
 export const PIXIV_APP_USER_AGENT = 'PixivAndroidApp/6.127.0 (Android 14; Pixel 6)';
 

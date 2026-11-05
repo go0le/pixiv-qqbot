@@ -27,7 +27,10 @@ import {
 import { sendMediaFile } from '../media/send-media.ts';
 import { chunkMarkdownText } from '../transport/chunker.ts';
 import { ReplyLimiter } from '../transport/reply-limiter.ts';
-import { defaultPixivService } from '../pixiv/index.ts';
+import { defaultPixivService, parseNaturalPixivQuery } from '../pixiv/index.ts';
+
+import { looksLikePixivImageAsk } from './image-intent.ts';
+
 import type { AntigravityBotConfig } from './types.ts';
 
 export class AntigravityQQBot {
@@ -49,7 +52,7 @@ export class AntigravityQQBot {
     };
 
     this.sessionManager = new AntigravitySessionManager(
-      this.config.antigravity || {},
+      { idleTimeoutMs: Number(process.env.AGY_IDLE_TIMEOUT_MS || 2 * 60 * 60 * 1000), ...(this.config.antigravity || {}) },
       this.config.groupSessionScope,
     );
   }
@@ -104,6 +107,7 @@ export class AntigravityQQBot {
     this.bot.on('ready', () => {
       console.log(`\n======================================================`);
       console.log(` [Antigravity QQBot] Ready & Connected!`);
+      void defaultPixivService.llmResolver.warmUp();
       console.log(` AppID: ${creds.appId}`);
       console.log(` Engine: Antigravity CLI (${this.config.antigravity?.agyPath || 'default agy'})`);
       console.log(`======================================================\n`);
@@ -165,6 +169,17 @@ export class AntigravityQQBot {
       if (handled) return;
     }
 
+    // 明文要图（如「来五张巨乳大姐姐」）软路由到 /pixiv，避免 Gemini 安全策略拒答且不调工具
+    if (downloadedMedia.length === 0 && looksLikePixivImageAsk(content)) {
+      const nq = parseNaturalPixivQuery(content);
+      if (nq.keyword) {
+        const routed = `/pixiv ${nq.keyword}${nq.count ? ` ${nq.count}` : ''}`;
+        console.log(`[Antigravity QQBot] Soft-route image ask -> ${routed}`);
+        const handled = await this.handleCommand(target, routed, userId);
+        if (handled) return;
+      }
+    }
+
     const fullPrompt = buildPromptWithMedia(content, downloadedMedia);
 
     if (this.config.debug || downloadedMedia.length > 0) {
@@ -185,7 +200,7 @@ export class AntigravityQQBot {
           '',
           '- 直接发送问题或需求，机器人将调用 Antigravity Agent 执行并回复',
           '- `/clear` 或 `/reset`：清空当前会话记忆，开启新对话',
-          '- `/pixiv <关键词> [数量]`：检索并投递插画（多标签须同时命中，1~3 张）',
+          '- `/pixiv <关键词> [数量]`：检索并投递插画（多标签须同时命中，1~5 张）',
           '- `/status`：查看当前会话状态及 Antigravity 运行信息',
           '- `/ping`：健康检查',
           '- `/help`：查看此帮助信息',
@@ -231,21 +246,13 @@ export class AntigravityQQBot {
           await this.sendReply(target, '📌 请输入角色或标签名，例如：`/pixiv 信浓` 或 `/pixiv 信浓 泳装 2`');
           return true;
         }
-        let count = 1;
-        const tagTokens = [...rawTokens];
-        const lastToken = tagTokens[tagTokens.length - 1];
-        if (lastToken && /^[1-9]\d*$/.test(lastToken)) {
-          const parsed = parseInt(lastToken, 10);
-          if (!Number.isNaN(parsed)) {
-            count = Math.max(1, Math.min(3, parsed));
-            tagTokens.pop();
-          }
-        }
-        if (tagTokens.length === 0) {
+        const nq = parseNaturalPixivQuery(rawTokens.join(' '));
+        const count = nq.count ?? 1;
+        const keyword = nq.keyword;
+        if (!keyword) {
           await this.sendReply(target, '📌 请输入角色或标签名，例如：`/pixiv 信浓` 或 `/pixiv 信浓 泳装 2`');
           return true;
         }
-        const keyword = tagTokens.join(' ');
         const chatKey = `${target.scope}:${target.targetId}`;
         const cdResult = defaultPixivService.consumeCooldown(chatKey);
         if (!cdResult.allowed) {
@@ -266,12 +273,13 @@ export class AntigravityQQBot {
             return true;
           }
 
+          if (res.corrected) console.log(`[pixiv] ${res.corrected}`);
           for (const illust of res.illustrations) {
             if (illust.localPath) {
               try {
                 if (this.bot?.sendImage) {
-                  await this.bot.sendImage(target, { localPath: illust.localPath });
-                  await this.sendReply(target, `🎨 画师：${illust.artist}`);
+                  // 图片与画师合成 1 条消息，避免超过 QQ 被动回复 5 条上限
+                  await this.bot.sendImage(target, { localPath: illust.localPath }, { content: `🎨 画师：${illust.artist}` });
                 }
               } catch {}
             }

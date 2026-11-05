@@ -24,6 +24,8 @@ export interface PixivIllustration {
   originalUrl?: string;
   /** 是否来自本地缓存命中 */
   isFromCache: boolean;
+  /** 联网检索时所属的质量档位（0=最高档）。排序时先看档位再看得分；本地缓存视为 0 */
+  tierRank?: number;
   /** 作品页码（多页插画，从 0 开始，默认为 0） */
   page?: number;
   /** 作品介质类型：0=插画, 1=漫画, 2=动图(Ugoira) */
@@ -50,6 +52,8 @@ export interface PixivSearchResult {
   blockReason?: string;
   /** 结果为空时可以展示给用户的说明（例如没配登录态） */
   notice?: string;
+  /** 0 结果后经 LLM 纠错重搜时的纠正说明（如 涼花ひより -> 涼海ひより） */
+  corrected?: string;
 }
 
 /** 本地元数据缓存项 (对应 MEDIA_ROOT/pixiv_{PID}_p{PAGE} 的元信息) */

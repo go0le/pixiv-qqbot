@@ -4,14 +4,26 @@
  * Manages conversation instances across QQ peer targets (C2C users, group chats).
  * Features:
  * - Lazy process instantiation
- * - Deterministic UUID conversation mapping
+ * - Conversation resume across restarts: persists epoch + the conversation ID agy actually assigned (agy ignores unknown --conversation IDs)
  * - Reset support (/clear, /reset) with epoch bumps
  * - Automatic idle process reaping to preserve memory
  * - Turn queueing to prevent interleaved prompts
  */
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { AntigravityConfig } from './types.ts';
 import { deriveConversationId, buildSessionKey } from './session-id.ts';
-import { AntigravityProcess, type ProcessTurnCallbacks } from './process.ts';
+import { AntigravityProcess, AgyBlockedToolError, type ProcessTurnCallbacks } from './process.ts';
+
+/** 模型调用了会挂起整轮的工具（如 schedule）被打断后，续接同一个会话时发给它的说明 */
+const BLOCKED_TOOL_NOTICE = (tool: string): string =>
+  `[系统提示，不是用户发的] 你刚才调用的 ${tool} 工具在 QQ 机器人里不能用：它会让这一轮一直挂着，期间用户发来的新消息都收不到，程序已经把它取消了，以后也不要再用。`
+  + '需要定时提醒或到点做事，请改用系统定时任务（例如 `systemd-run --on-calendar=...`，到点自己运行，不用你在线等）；没有执行命令的权限就如实告诉用户做不了。'
+  + '然后像平常一样直接回复用户刚才那条消息，不要提到这条系统提示。';
+
+/** 一轮结束了却没有任何回复文字（常见原因：工具没有权限被自动拒绝，agy 直接结束本轮）时，追问一次 */
+const EMPTY_REPLY_NUDGE = '[系统提示，不是用户发的] 上一步没有产生任何回复文字（可能是某个工具没有权限、被自动拒绝了）。'
+  + '请直接用文字回复用户刚才那条消息；做不到的事如实说明。不要提到这条系统提示。';
 
 export interface AntigravitySession {
   readonly sessionKey: string;
@@ -20,6 +32,8 @@ export interface AntigravitySession {
   readonly userId?: string;
   epoch: number;
   conversationId: string;
+  /** agy 实际分配的会话 ID（agy 会忽略本地不存在的 --conversation 并自己新建）；有就优先用它续接 */
+  agyConversationId?: string;
   busy: boolean;
   process: AntigravityProcess | null;
   lastActiveAt: number;
@@ -31,19 +45,63 @@ export interface AntigravitySession {
   }>;
 }
 
+/** 持久化的会话状态：每个 sessionKey 的 epoch 和 agy 真实会话 ID，重启后据此续接上下文、保留 /clear 的效果 */
+interface PersistedSession {
+  epoch: number;
+  agyId?: string;
+}
+
 export class AntigravitySessionManager {
   private readonly sessions = new Map<string, AntigravitySession>();
   private readonly config: AntigravityConfig;
   private readonly groupScope: 'user' | 'group';
   private sweepTimer: NodeJS.Timeout | null = null;
+  private readonly stateFile: string | null;
+  private readonly persisted = new Map<string, PersistedSession>();
 
+  /**
+   * @param stateFile 会话状态文件（每个 agy HOME 一份，因为会话 ID 只在对应 HOME 里有效）。不传则不持久化。
+   */
   public constructor(
     config: AntigravityConfig = {},
     groupScope: 'user' | 'group' = 'user',
+    stateFile: string | null = null,
   ) {
     this.config = config;
     this.groupScope = groupScope;
+    this.stateFile = stateFile;
+    this.loadState();
     this.startIdleSweep();
+  }
+
+  private loadState(): void {
+    if (!this.stateFile || !existsSync(this.stateFile)) return;
+    try {
+      const d = JSON.parse(readFileSync(this.stateFile, 'utf8')) as Record<string, PersistedSession>;
+      for (const [k, v] of Object.entries(d)) {
+        if (v && Number.isInteger(v.epoch) && v.epoch >= 0) this.persisted.set(k, { epoch: v.epoch, agyId: typeof v.agyId === 'string' ? v.agyId : undefined });
+      }
+    } catch (err) {
+      console.warn('[AntigravitySessionManager] state file unreadable, starting fresh:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private saveState(): void {
+    if (!this.stateFile) return;
+    try {
+      const dir = dirname(this.stateFile);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const tmp = `${this.stateFile}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.persisted), null, 1), { encoding: 'utf8', mode: 0o600 });
+      renameSync(tmp, this.stateFile);
+    } catch (err) {
+      console.warn('[AntigravitySessionManager] state save failed:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private remember(session: AntigravitySession): void {
+    this.persisted.set(session.sessionKey, { epoch: session.epoch, agyId: session.agyConversationId });
+    this.saveState();
   }
 
   public getSessionCount(): number {
@@ -73,7 +131,8 @@ export class AntigravitySessionManager {
     let session = this.sessions.get(key);
 
     if (!session) {
-      const epoch = 0;
+      const saved = this.persisted.get(key);
+      const epoch = saved?.epoch ?? 0;
       const conversationId = deriveConversationId(key, epoch);
       session = {
         sessionKey: key,
@@ -82,6 +141,7 @@ export class AntigravitySessionManager {
         userId,
         epoch,
         conversationId,
+        agyConversationId: saved?.agyId,
         busy: false,
         process: null,
         lastActiveAt: Date.now(),
@@ -96,7 +156,14 @@ export class AntigravitySessionManager {
   public getProcess(session: AntigravitySession): AntigravityProcess {
     session.lastActiveAt = Date.now();
     if (!session.process) {
-      session.process = new AntigravityProcess(session.conversationId, this.config);
+      const proc = new AntigravityProcess(session.agyConversationId ?? session.conversationId, this.config);
+      proc.on('conversation', (id: string) => {
+        // 进程可能已被 reset 替换掉；只接受当前进程的上报
+        if (session.process !== proc || session.agyConversationId === id) return;
+        session.agyConversationId = id;
+        this.remember(session);
+      });
+      session.process = proc;
     }
     return session.process;
   }
@@ -126,7 +193,9 @@ export class AntigravitySessionManager {
     session.busy = false;
     session.epoch += 1;
     session.conversationId = deriveConversationId(session.sessionKey, session.epoch);
+    session.agyConversationId = undefined;
     session.lastActiveAt = Date.now();
+    this.remember(session);
 
     return session;
   }
@@ -167,7 +236,22 @@ export class AntigravitySessionManager {
     const proc = this.getProcess(session);
     session.lastActiveAt = Date.now();
     try {
-      const result = await proc.sendUserMessage(prompt, callbacks);
+      let result;
+      try {
+        result = await proc.sendUserMessage(prompt, callbacks);
+      } catch (err) {
+        if (!(err instanceof AgyBlockedToolError)) throw err;
+        // 进程已被打断；同一个对象会等旧进程退干净、用 agy 会话 ID 起新进程续接上下文，只重试一次
+        console.warn(`[AntigravitySessionManager] ${session.sessionKey}: ${err.message}; resuming with a notice`);
+        result = await this.getProcess(session).sendUserMessage(BLOCKED_TOOL_NOTICE(err.tool), callbacks);
+        if (err.partialText.trim() && !result.response.includes(err.partialText.trim())) {
+          result.response = `${err.partialText.trim()}\n${result.response}`;
+        }
+      }
+      if (!result.response.trim()) {
+        console.warn(`[AntigravitySessionManager] ${session.sessionKey}: turn ended with no reply text, nudging once`);
+        result = await this.getProcess(session).sendUserMessage(EMPTY_REPLY_NUDGE, callbacks);
+      }
       session.lastActiveAt = Date.now();
       return result.response;
     } finally {

@@ -60,6 +60,8 @@ export class DynamicTagStore {
   public set(key: string, tags: string | string[]): void {
     const norm = this.normalizeKey(key);
     if (!norm) return;
+    // 不缓存整句口语（过长或含数量/图片等虚词）的映射
+    if (norm.length > 10 || /[张幅]|图片|^来|帮我|给我/.test(norm)) return;
 
     const tagList = (Array.isArray(tags) ? tags : [tags])
       .map(t => t.trim())
@@ -80,6 +82,12 @@ export class DynamicTagStore {
 
     this.map.set(norm, tagList);
     this.dirty = true;
+  }
+
+  /** 删除映射 */
+  public delete(key: string): void {
+    const norm = this.normalizeKey(key);
+    if (this.map.delete(norm)) this.dirty = true;
   }
 
   /**

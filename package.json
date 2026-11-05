@@ -2,11 +2,12 @@
   "name": "@tencent-connect/dsh-qqbot",
   "version": "0.5.4",
   "icon": "./assets/icons/qq_logo.svg",
-  "description": "在 QQ 私聊和群聊里直接对话 DeepSeek Harness。 Chat with DeepSeek Harness in QQ private and group chats. Includes Pixiv search fixes (blacklist whole-word matching).",
+  "description": "在 QQ 私聊和群聊里直接对话 DeepSeek Harness。 Chat with DeepSeek Harness in QQ private and group chats.",
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
-    "agy-qqbot": "./dist/bin/agy-qqbot.js"
+    "agy-qqbot": "./dist/bin/agy-qqbot.js",
+    "napcat-qqbot": "./dist/bin/napcat-qqbot.js"
   },
   "types": "./dist/index.d.ts",
   "exports": {
@@ -28,6 +29,7 @@
     "lint": "eslint src/",
     "test": "vitest run",
     "start:agy": "node dist/bin/agy-qqbot.js",
+    "start:napcat": "node --experimental-websocket dist/bin/napcat-qqbot.js",
     "test:agy": "vitest run src/antigravity/",
     "typecheck:client": "tsc -p tsconfig.client.json",
     "clean": "rm -rf dist lib",
@@ -50,11 +52,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/go0le/pixiv-qqbot.git"
+    "url": "https://github.com/tencent-connect/dsh-qqbot.git"
   },
-  "homepage": "https://github.com/go0le/pixiv-qqbot#readme",
+  "homepage": "https://github.com/tencent-connect/dsh-qqbot#readme",
   "bugs": {
-    "url": "https://github.com/go0le/pixiv-qqbot/issues"
+    "url": "https://github.com/tencent-connect/dsh-qqbot/issues"
   },
   "dsh": {
     "bundle": {

@@ -315,6 +315,7 @@ describe('Pixiv relevance: AND, unrelated tags, explicit greylist', () => {
     expect(search).toBeTruthy();
     expect(search!.authorization).toBe('Bearer access-test');
     expect(decodeURIComponent(search!.url)).toContain('水着');
-    expect(search!.url).toContain('filter=for_ios');
+    // 默认不加 for_ios（它会连带滤掉 Pixiv 标为「敏感」的全年龄图）；R-18 由 xRestrict 在本地拦截。PIXIV_SAFE_FILTER=1 才恢复。
+    expect(search!.url).not.toContain('filter=for_ios');
   });
 });

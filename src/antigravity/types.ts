@@ -75,6 +75,14 @@ export interface AntigravityConfig {
   turnTimeoutMs?: number;
   /** Additional CLI flags to pass to agy */
   extraArgs?: string[];
+  /** Extra environment variables for the agy child process (e.g. HOME to select a restricted profile) */
+  env?: Record<string, string>;
+  /**
+   * Replace the child's environment entirely with this map (plus FORCE_COLOR), instead of inheriting
+   * process.env. Used to run the tag-correction agy without secrets (PIXIV_REFRESH_TOKEN 等)。
+   * When set, `env` is ignored.
+   */
+  replaceEnv?: Record<string, string>;
   /** Debug logging */
   debug?: boolean;
 }
